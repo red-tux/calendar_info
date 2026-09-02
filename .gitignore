@@ -220,3 +220,5 @@ __marimo__/
 # Plugin runtime artifacts (created inside the plugin folder by StreamController)
 .venv/
 cache/
+
+.devcontainer/devcontainer-lock.json

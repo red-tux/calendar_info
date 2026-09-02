@@ -47,8 +47,11 @@
   ],
   "containerEnv": {
     "DISPLAY": "${localEnv:DISPLAY}",
-    // Absolute socket path, so it works whatever the host's XDG_RUNTIME_DIR is.
-    "WAYLAND_DISPLAY": "/run/host-user/${localEnv:WAYLAND_DISPLAY:wayland-0}",
+    // Socket *name*, not a path: StreamController's `wayland` package builds the socket
+    // path as "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" unconditionally, so an absolute value
+    // here yields /run/user/1000//run/host-user/wayland-0 and crashes startup.
+    // post-start.sh links $XDG_RUNTIME_DIR/<name> to the host socket under /run/host-user.
+    "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY:wayland-0}",
     "XDG_RUNTIME_DIR": "/run/user/1000",
     "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
     "PULSE_SERVER": "unix:/run/host-user/pulse/native",
