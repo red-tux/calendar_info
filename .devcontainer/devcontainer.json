@@ -1,0 +1,84 @@
+{
+  "name": "Calendar Info (StreamController plugin)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "options": ["--network", "host"],
+    "args": {
+      // Branch, tag or full commit sha of StreamController to develop against.
+      // Override without editing this file: export STREAMCONTROLLER_REF=1.5.0-beta.15
+      // before launching VS Code / the devcontainer CLI, then "Rebuild Container".
+      // To switch after building, run `fetch-streamcontroller "" <ref>` inside the container.
+      "STREAMCONTROLLER_REF": "${localEnv:STREAMCONTROLLER_REF:main}",
+      "STREAMCONTROLLER_REPO": "${localEnv:STREAMCONTROLLER_REPO:https://github.com/StreamController/StreamController.git}",
+      "PYTHON_VERSION": "${localEnv:STREAMCONTROLLER_PYTHON:3.12}"
+    }
+  },
+  "remoteUser": "ubuntu",
+
+  // StreamController discovers plugins by folder name under <data>/plugins, so this
+  // repository is mounted directly at its install path inside the app's data dir.
+  // No symlink, no copy step: what you edit is what the app loads.
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/StreamController/data/plugins/net_red-tux_calendar_info,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/StreamController/data/plugins/net_red-tux_calendar_info",
+
+  "runArgs": [
+    "--init",
+    "--privileged",
+    "--network=host",
+    "--device=/dev/bus/usb:/dev/bus/usb"
+  ],
+  "mounts": [
+    // Host display: X11 socket dir, plus the whole XDG runtime dir (Wayland socket,
+    // PulseAudio/PipeWire socket). Mounting the directory rather than a single socket
+    // file means an X11-only or Wayland-only host still starts the container.
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
+    "source=${localEnv:XDG_RUNTIME_DIR:/run/user/1000},target=/run/host-user,type=bind",
+
+    // Persisted across container rebuilds (named per workspace via ${devcontainerId}):
+    //  - the app's data dir: pages, plugin settings, logs, store-installed plugins
+    //  - Claude Code's config dir: login, settings, memory and session transcripts
+    //  - shell history
+    "source=calendar-info-sc-data-${devcontainerId},target=/workspaces/StreamController/data,type=volume",
+    "source=calendar-info-claude-config-${devcontainerId},target=/home/ubuntu/.claude,type=volume",
+    "source=calendar-info-bash-history-${devcontainerId},target=/commandhistory,type=volume"
+  ],
+  "containerEnv": {
+    "DISPLAY": "${localEnv:DISPLAY}",
+    // Absolute socket path, so it works whatever the host's XDG_RUNTIME_DIR is.
+    "WAYLAND_DISPLAY": "/run/host-user/${localEnv:WAYLAND_DISPLAY:wayland-0}",
+    "XDG_RUNTIME_DIR": "/run/user/1000",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+    "PULSE_SERVER": "unix:/run/host-user/pulse/native",
+    "GSK_RENDERER": "ngl",
+    "PKG_CONFIG_PATH": "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig:${containerEnv:PKG_CONFIG_PATH}",
+    // Keeps ~/.claude.json (the OAuth account) inside the persisted volume too.
+    "CLAUDE_CONFIG_DIR": "/home/ubuntu/.claude"
+  },
+
+  // Optional: Claude Code. Installs the CLI and the VS Code extension. Nothing else in
+  // this container depends on it - users without a Claude account simply never run it.
+  "features": {
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/app/.venv/bin/python",
+        // Resolve StreamController's own modules (src.backend..., GtkHelper...) that
+        // this plugin imports.
+        "python.analysis.extraPaths": ["/workspaces/StreamController"],
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",
+  "postStartCommand": "bash .devcontainer/scripts/post-start.sh"
+}
