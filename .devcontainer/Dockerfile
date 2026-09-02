@@ -15,7 +15,9 @@
 FROM ubuntu:25.04
 
 ARG PYTHON_VERSION=3.12
-ARG STREAMCONTROLLER_REPO=https://github.com/StreamController/StreamController.git
+# Empty = upstream; fetch-streamcontroller fills in the default (a URL can't be the default
+# in devcontainer.json's ${localEnv:...} syntax, so the empty value has to be handled here).
+ARG STREAMCONTROLLER_REPO=""
 ARG STREAMCONTROLLER_REF=main
 
 ENV DEBIAN_FRONTEND=noninteractive
