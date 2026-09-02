@@ -1,0 +1,12 @@
+{
+    "id": "net_red-tux_calendar_info",
+    "name": "Calendar Info",
+    "version": "0.1.0",
+    "app-version": "1.5.0-beta.15",
+    "minimum-app-version": "1.5.0-beta.15",
+    "github": "https://github.com/red-tux/calendar_info",
+    "description": "Calendar notifications on your Stream Deck: see your next event with a live countdown that changes color as it approaches, browse today's agenda, and press to join the meeting. Works with any iCalendar (.ics) feed, including Google Calendar's private address.",
+    "short-description": "Next event, countdown and agenda from any iCalendar feed.",
+    "tags": ["Productivity", "Calendar"],
+    "thumbnail": "assets/thumbnail.png"
+}
