@@ -1,0 +1,9 @@
+{
+    "generic": {
+        "copyright": "Copyright (c) 2026 Andrew Nelson",
+        "original-url": "https://github.com/red-tux/calendar_info",
+        "license": "MIT",
+        "license-url": "https://github.com/red-tux/calendar_info/blob/main/LICENSE",
+        "description": "Calendar Info plugin source code. Bundled icons under assets/icons/material/ are Google's Material Icons (Apache License 2.0, not this MIT license) - see assets/icons/material/NOTICE.md."
+    }
+}

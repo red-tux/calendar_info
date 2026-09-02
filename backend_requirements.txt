@@ -1,0 +1,4 @@
+streamcontroller-plugin-tools==2.0.2
+icalendar==7.3.0
+recurring-ical-events==3.8.2
+requests==2.34.2
