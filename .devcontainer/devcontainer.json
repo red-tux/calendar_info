@@ -9,7 +9,10 @@
       // before launching VS Code / the devcontainer CLI, then "Rebuild Container".
       // To switch after building, run `fetch-streamcontroller "" <ref>` inside the container.
       "STREAMCONTROLLER_REF": "${localEnv:STREAMCONTROLLER_REF:main}",
-      "STREAMCONTROLLER_REPO": "${localEnv:STREAMCONTROLLER_REPO:https://github.com/StreamController/StreamController.git}",
+      // Empty means upstream (https://github.com/StreamController/StreamController.git).
+      // The default can't be spelled out here: ${localEnv:NAME:default} splits on the
+      // first colon, so a URL default would be cut down to "https".
+      "STREAMCONTROLLER_REPO": "${localEnv:STREAMCONTROLLER_REPO}",
       "PYTHON_VERSION": "${localEnv:STREAMCONTROLLER_PYTHON:3.12}"
     }
   },
