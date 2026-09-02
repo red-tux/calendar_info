@@ -60,7 +60,10 @@
 
   // Optional: Claude Code. Installs the CLI and the VS Code extension. Nothing else in
   // this container depends on it - users without a Claude account simply never run it.
+  // The Node feature comes first: the Claude Code feature needs Node.js + npm, and the
+  // nodejs packages in Ubuntu 25.04's apt don't satisfy its check.
   "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
     "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
   },
 
