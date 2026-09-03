@@ -52,6 +52,7 @@ class NextEvent(CalendarActionMixin, KeyAction):
             include_all_day=self.include_all_day(),
             include_in_progress=self.show_in_progress(),
             horizon=timedelta(hours=hours) if hours > 0 else None,
+            calendar_ids=self.selected_calendar_ids(),
         )
 
     def render(self) -> None:

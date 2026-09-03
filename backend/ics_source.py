@@ -25,13 +25,11 @@ from internal.events import (  # noqa: E402
     as_utc,
     extract_meeting_link,
 )
+# Re-exported: callers (and tests) have always imported SourceError from this module.
+from backend.source_errors import SourceError  # noqa: E402,F401
 
 DEFAULT_TIMEOUT = 20
 USER_AGENT = "StreamController-CalendarInfo/0.1 (+https://github.com/red-tux/calendar_info)"
-
-
-class SourceError(Exception):
-    """A calendar source could not be fetched or parsed. Message is user-facing."""
 
 
 def normalize_source(source: str) -> str:
@@ -120,6 +118,22 @@ def _event_bounds(component) -> tuple[datetime, datetime, bool]:
     return start, end, all_day
 
 
+def _event_tzid(component, dtstart) -> str:
+    """The zone the event was written in: the DTSTART TZID parameter when there is one, else
+    whatever tzinfo icalendar attached (a ZoneInfo stringifies to its IANA name). A UTC
+    (`...Z`) DTSTART reports "UTC"; a floating time reports nothing.
+    """
+    prop = component.get("DTSTART")
+    tzid = ""
+    params = getattr(prop, "params", None)
+    if params is not None:
+        tzid = str(params.get("TZID") or "").strip()
+    if not tzid and isinstance(dtstart, datetime) and dtstart.tzinfo is not None:
+        key = getattr(dtstart.tzinfo, "key", None)        # zoneinfo
+        tzid = str(key or dtstart.tzinfo)
+    return "UTC" if tzid.upper() in ("UTC", "Z", "GMT") else tzid
+
+
 def _conference_url(component) -> str | None:
     # RFC 7986 CONFERENCE (may repeat) and Google's X-GOOGLE-CONFERENCE come before the
     # free-text fields; they're the authoritative "join" address when present.
@@ -162,6 +176,7 @@ def expand_events(ics_text: str, calendar_id: str, window_start: datetime, windo
             start, end, all_day = _event_bounds(component)
         except SourceError:
             continue
+        tzid = "" if all_day else _event_tzid(component, component.decoded("DTSTART", None))
 
         instance_uid = f"{series_uid}::{start.date().isoformat() if all_day else as_utc(start).isoformat()}"
         if instance_uid in seen:
@@ -186,6 +201,7 @@ def expand_events(ics_text: str, calendar_id: str, window_start: datetime, windo
             url=url_prop,
             meeting_link=extract_meeting_link(_conference_url(component), location, description, url_prop),
             status=status,
+            tzid=tzid,
         )
         events.append(event)
 

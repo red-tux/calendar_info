@@ -37,9 +37,12 @@ class EventBrowserMixin(CalendarActionMixin):
         limit = int(self.max_events_row.get_value(fallback=DEFAULT_MAX_EVENTS))
         scope = self.scope_row.get_value(fallback=SCOPE_UPCOMING)
         # Browsing shows everything, including events skipped on a Next Event key.
-        kwargs = dict(include_all_day=self.include_all_day(), include_in_progress=self.show_in_progress(), include_skipped=True)
+        kwargs = dict(include_all_day=self.include_all_day(), include_in_progress=self.show_in_progress(),
+                      include_skipped=True, calendar_ids=self.selected_calendar_ids())
         if scope == SCOPE_TODAY:
-            end_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            # "Today" has to end at midnight in the zone the key displays, not the machine's.
+            local_now = now.astimezone(self.display_tz())
+            end_of_day = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
             return self.store.get_upcoming(now, limit=limit, horizon=end_of_day - now, **kwargs)
         return self.store.get_upcoming(now, limit=limit, **kwargs)
 

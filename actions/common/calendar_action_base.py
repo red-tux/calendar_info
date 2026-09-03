@@ -17,7 +17,10 @@ from datetime import datetime, timedelta
 
 from loguru import logger as log
 from PIL import Image, ImageDraw
-from gi.repository import GLib, Gio
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import GLib, Gio, Gtk, Adw
 
 from GtkHelper.GenerativeUI.ComboRow import ComboRow
 from GtkHelper.GenerativeUI.SpinRow import SpinRow
@@ -26,9 +29,10 @@ from GtkHelper.GenerativeUI.SwitchRow import SwitchRow
 from ...internal.events import (
     CalendarEvent,
     format_countdown,
-    format_day,
+    format_event_day,
     format_remaining,
     format_start,
+    resolve_tz,
     truncate,
 )
 
@@ -75,6 +79,11 @@ COLOR_ASSET_DEFAULTS = {
 
 # What each label slot can show.
 LABEL_CHOICES = ["none", "title", "countdown", "time", "day", "calendar", "location", "position"]
+
+# Which calendars an action shows: "all" follows the plugin's calendar list, "selected"
+# restricts it to the ids in the `calendar_ids` setting.
+CALENDAR_FILTER_ALL = "all"
+CALENDAR_FILTER_SELECTED = "selected"
 
 LEVEL_NORMAL = "normal"
 LEVEL_WARN = "warn"
@@ -178,6 +187,14 @@ class CalendarActionMixin:
     def options(self):
         return self.plugin_base.options
 
+    def display_tz(self, event: CalendarEvent | None = None):
+        """The zone this key displays times in (plugin option "Display Timezone").
+
+        In "event" mode this is per event, so pass the event being rendered; date *ranges*
+        (the Agenda's "today" scope) pass nothing and get the machine's zone.
+        """
+        return resolve_tz(self.options.display_timezone, event)
+
     def open_link(self, url: str | None) -> None:
         """Open a meeting link in the default browser. Runs on the event thread."""
         if not url:
@@ -248,6 +265,86 @@ class CalendarActionMixin:
     def show_icon(self) -> bool: return bool(self.show_icon_row.get_value(fallback=True))
     def title_chars(self) -> int: return int(self.title_chars_row.get_value(fallback=DEFAULT_TITLE_CHARS))
 
+    # --- calendar filter ----------------------------------------------------------------
+    #
+    # Hand-built rather than a GenerativeUI row: the choices are the user's configured
+    # calendars, which change while the app runs, and GenerativeUI binds one static key per
+    # widget. get_config_rows() is called each time the action is opened in the sidebar, so
+    # rebuilding here is also what keeps the list current.
+
+    def selected_calendar_ids(self) -> set[str] | None:
+        """The calendars this action shows, or None for all of them.
+
+        Falls back to None when "selected" is configured but nothing is ticked (or nothing
+        ticked still exists), so a stale selection shows everything instead of an empty key.
+        """
+        settings = self.get_settings() or {}
+        if settings.get("calendar_filter", CALENDAR_FILTER_ALL) != CALENDAR_FILTER_SELECTED:
+            return None
+        configured = {c["id"] for c in self.plugin_base.get_calendars()}
+        chosen = {str(i) for i in settings.get("calendar_ids") or []} & configured
+        return chosen or None
+
+    def _save_calendar_filter(self, filter_mode: str, calendar_ids: list[str]) -> None:
+        settings = self.get_settings() or {}
+        settings["calendar_filter"] = filter_mode
+        settings["calendar_ids"] = calendar_ids
+        self.set_settings(settings)
+        # Same effect as a GenerativeUI row's on_change: drop the dedup key and repaint.
+        self._on_setting_changed(None, None, None)
+
+    def calendar_filter_summary(self) -> str:
+        """Plain text; escape it before it goes into a row (Adw parses those as markup)."""
+        settings = self.get_settings() or {}
+        calendars = self.plugin_base.get_calendars()
+        if settings.get("calendar_filter", CALENDAR_FILTER_ALL) != CALENDAR_FILTER_SELECTED:
+            return "All calendars"
+        chosen = {str(i) for i in settings.get("calendar_ids") or []}
+        names = [c["name"] for c in calendars if c["id"] in chosen]
+        if not names:
+            return "Nothing picked - showing all calendars"
+        if len(names) <= 2:
+            return ", ".join(names)
+        return f"{len(names)} of {len(calendars)} calendars"
+
+    def build_calendar_filter_row(self) -> "Adw.ExpanderRow":
+        settings = self.get_settings() or {}
+        calendars = self.plugin_base.get_calendars()
+        chosen = {str(i) for i in settings.get("calendar_ids") or []}
+        show_all = settings.get("calendar_filter", CALENDAR_FILTER_ALL) != CALENDAR_FILTER_SELECTED
+
+        row = Adw.ExpanderRow(title="Calendars",
+                              subtitle=GLib.markup_escape_text(self.calendar_filter_summary()))
+        all_row = Adw.SwitchRow(title="All calendars",
+                                subtitle="Off: pick the ones this key follows", active=show_all)
+        row.add_row(all_row)
+
+        switches: list[tuple[str, Adw.SwitchRow]] = []
+        for calendar in calendars:
+            switch_row = Adw.SwitchRow(title=GLib.markup_escape_text(calendar["name"]),
+                                       active=calendar["id"] in chosen, sensitive=not show_all)
+            row.add_row(switch_row)
+            switches.append((calendar["id"], switch_row))
+        if not calendars:
+            row.add_row(Adw.ActionRow(title="No calendars configured yet",
+                                      subtitle="Add one in Settings, under the Calendar Info plugin"))
+
+        def apply(*_args) -> None:
+            all_on = all_row.get_active()
+            for _id, switch_row in switches:
+                switch_row.set_sensitive(not all_on)
+            mode = CALENDAR_FILTER_ALL if all_on else CALENDAR_FILTER_SELECTED
+            self._save_calendar_filter(mode, [cid for cid, sw in switches if sw.get_active()])
+            row.set_subtitle(GLib.markup_escape_text(self.calendar_filter_summary()))
+
+        all_row.connect("notify::active", apply)
+        for _id, switch_row in switches:
+            switch_row.connect("notify::active", apply)
+        return row
+
+    def get_config_rows(self) -> list:
+        return [self.build_calendar_filter_row()]
+
     # --- event -> display logic -------------------------------------------------------------
 
     def alert_level(self, event: CalendarEvent | None, now: datetime) -> str:
@@ -272,16 +369,19 @@ class CalendarActionMixin:
             return "No events" if kind == "title" else ""
         if kind == "title":
             return truncate(event.title, self.title_chars())
+        tz = self.display_tz(event)
         if kind == "countdown":
+            # Countdowns are durations, so they need no zone - but an all-day event has no
+            # clock time and shows its day instead.
             if event.is_in_progress(now):
                 return format_remaining(event.seconds_until_end(now))
             if event.all_day:
-                return format_day(event.start, now)
+                return format_event_day(event, now, tz)
             return format_countdown(event.seconds_until_start(now))
         if kind == "time":
-            return format_start(event, now, self.options.time_format)
+            return format_start(event, now, self.options.time_format, tz)
         if kind == "day":
-            return format_day(event.start, now)
+            return format_event_day(event, now, tz)
         if kind == "calendar":
             return truncate(event.calendar_name, self.title_chars())
         if kind == "location":

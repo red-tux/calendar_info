@@ -220,5 +220,8 @@ __marimo__/
 # Plugin runtime artifacts (created inside the plugin folder by StreamController)
 .venv/
 cache/
+# Google refresh tokens, written by the backend. Never commit these: the plugin folder is
+# this git repo when developing in the dev container.
+credentials/
 
 .devcontainer/devcontainer-lock.json

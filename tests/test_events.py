@@ -3,13 +3,19 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from internal.events import (
+    TZ_EVENT,
+    TZ_LOCAL,
+    TZ_UTC,
     CalendarEvent,
     extract_meeting_link,
     format_clock,
     format_countdown,
     format_day,
+    format_event_day,
     format_remaining,
     format_start,
+    local_tz,
+    resolve_tz,
     truncate,
 )
 
@@ -112,6 +118,49 @@ class TimeHelperTests(unittest.TestCase):
         all_day = CalendarEvent(uid="d", calendar_id="c", title="t", all_day=True,
                                 start=datetime(2026, 9, 3, tzinfo=NY), end=datetime(2026, 9, 4, tzinfo=NY))
         self.assertEqual(format_start(all_day, now, "24", NY), "Tomorrow")
+
+    def test_display_timezone_modes(self):
+        """The reported bug: an 11:00 America/New_York meeting must not render as 15:00."""
+        event = CalendarEvent(
+            uid="a", calendar_id="c", title="Meeting", tzid="America/New_York",
+            start=datetime(2026, 9, 3, 15, 0, tzinfo=UTC), end=datetime(2026, 9, 3, 15, 30, tzinfo=UTC),
+        )
+        now = datetime(2026, 9, 3, 14, 20, tzinfo=UTC)
+
+        self.assertEqual(format_clock(event.start, "24", resolve_tz(TZ_EVENT, event)), "11:00")
+        self.assertEqual(format_clock(event.start, "24", resolve_tz("America/New_York")), "11:00")
+        self.assertEqual(format_clock(event.start, "24", resolve_tz(TZ_UTC)), "15:00")
+        self.assertEqual(format_clock(event.start, "12", resolve_tz(TZ_EVENT, event)), "11:00am")
+        self.assertEqual(format_start(event, now, "24", resolve_tz(TZ_EVENT, event)), "11:00")
+
+        # An event with no zone of its own, and an unknown zone name, fall back to local.
+        bare = CalendarEvent(uid="b", calendar_id="c", title="t", start=event.start, end=event.end)
+        self.assertEqual(resolve_tz(TZ_EVENT, bare), local_tz())
+        self.assertEqual(resolve_tz("Mars/Olympus_Mons"), local_tz())
+        self.assertEqual(resolve_tz(TZ_LOCAL), local_tz())
+        self.assertEqual(resolve_tz(None), local_tz())
+        self.assertEqual(resolve_tz("UTC"), UTC)
+
+    def test_all_day_keeps_its_date_in_any_display_zone(self):
+        """All-day events are pinned to local midnight, so a naive astimezone() would move
+        them a day whenever the display zone is behind the machine's."""
+        now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+        all_day = CalendarEvent(uid="a", calendar_id="c", title="t", all_day=True,
+                                start=datetime(2026, 9, 4, tzinfo=UTC),
+                                end=datetime(2026, 9, 5, tzinfo=UTC))
+        for tz in (UTC, NY, ZoneInfo("Asia/Tokyo")):
+            self.assertEqual(format_event_day(all_day, now, tz), "Tomorrow")
+            self.assertEqual(format_start(all_day, now, "24", tz), "Tomorrow")
+
+    def test_tzid_survives_the_wire_format(self):
+        event = CalendarEvent(uid="a", calendar_id="c", title="t", tzid="Europe/Berlin",
+                              start=datetime(2026, 9, 3, 15, 0, tzinfo=UTC),
+                              end=datetime(2026, 9, 3, 16, 0, tzinfo=UTC))
+        self.assertEqual(CalendarEvent.from_dict(event.to_dict()).tzid, "Europe/Berlin")
+        # Events stored before this field existed simply have no zone.
+        legacy = dict(event.to_dict())
+        legacy.pop("tzid")
+        self.assertEqual(CalendarEvent.from_dict(legacy).tzid, "")
 
     def test_truncate(self):
         self.assertEqual(truncate("Weekly   sync", 20), "Weekly sync")

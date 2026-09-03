@@ -67,6 +67,39 @@ END:VCALENDAR
 """
 
 
+
+class EventZoneTest(unittest.TestCase):
+    ZONED = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//T//EN
+BEGIN:VEVENT
+UID:ny@example.com
+DTSTART;TZID=America/New_York:20260903T110000
+DTEND;TZID=America/New_York:20260903T113000
+SUMMARY:Eastern
+END:VEVENT
+BEGIN:VEVENT
+UID:utc@example.com
+DTSTART:20260903T150000Z
+DTEND:20260903T153000Z
+SUMMARY:Zulu
+END:VEVENT
+BEGIN:VEVENT
+UID:allday@example.com
+DTSTART;VALUE=DATE:20260903
+DTEND;VALUE=DATE:20260904
+SUMMARY:Whole day
+END:VEVENT
+END:VCALENDAR"""
+
+    def test_tzid_is_carried_per_event(self):
+        window = (datetime(2026, 9, 2, tzinfo=UTC), datetime(2026, 9, 5, tzinfo=UTC))
+        by_title = {e.title: e for e in expand_events(self.ZONED, "c", *window)}
+        self.assertEqual(by_title["Eastern"].tzid, "America/New_York")
+        self.assertEqual(by_title["Zulu"].tzid, "UTC")
+        # All-day events have no clock time, so no zone to display them in.
+        self.assertEqual(by_title["Whole day"].tzid, "")
+
 class ExpandTests(unittest.TestCase):
     def setUp(self):
         self.window_start = datetime(2026, 9, 1, tzinfo=UTC)

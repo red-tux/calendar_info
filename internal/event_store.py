@@ -91,15 +91,19 @@ class EventStore:
         include_cancelled: bool = False,
         include_skipped: bool = False,
         horizon: timedelta | None = None,
+        calendar_ids: set[str] | None = None,
     ) -> list[CalendarEvent]:
         """Events that haven't ended yet, soonest first. In-progress events come first when
-        included (they started earliest). `horizon` caps how far ahead to look."""
+        included (they started earliest). `horizon` caps how far ahead to look, and
+        `calendar_ids` restricts the result to those configured calendars (None = all)."""
         with self._lock:
             events = list(self._events)
             skipped = set(self._skipped)
         cutoff = now + horizon if horizon else None
         result = []
         for event in events:
+            if calendar_ids is not None and event.calendar_id not in calendar_ids:
+                continue
             if event.is_over(now):
                 continue
             if not include_in_progress and event.is_in_progress(now):
@@ -121,7 +125,8 @@ class EventStore:
         upcoming = self.get_upcoming(now, limit=1, **kwargs)
         return upcoming[0] if upcoming else None
 
-    def get_today(self, now: datetime, include_past: bool = True, **kwargs) -> list[CalendarEvent]:
+    def get_today(self, now: datetime, include_past: bool = True,
+                  calendar_ids: set[str] | None = None, **kwargs) -> list[CalendarEvent]:
         """Every event whose start falls on `now`'s local calendar day."""
         tz = now.tzinfo
         today = now.astimezone(tz).date()
@@ -129,6 +134,8 @@ class EventStore:
             events = list(self._events)
         result = []
         for event in events:
+            if calendar_ids is not None and event.calendar_id not in calendar_ids:
+                continue
             if event.start.astimezone(tz).date() != today:
                 continue
             if not include_past and event.is_over(now):

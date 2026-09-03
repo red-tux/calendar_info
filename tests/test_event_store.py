@@ -18,6 +18,25 @@ class EventStoreTests(unittest.TestCase):
         self.calls = []
         self.store = EventStore(dispatch=lambda cb, *a: (self.calls.append(cb), cb(*a)))
 
+    def test_calendar_id_filter(self):
+        work = ev("work-1", 15)
+        work.calendar_id = "work"
+        home = ev("home-1", 20)
+        home.calendar_id = "home"
+        later = ev("work-2", 200)
+        later.calendar_id = "work"
+        self.store.update([work, home, later], now=NOW)
+
+        self.assertEqual([e.uid for e in self.store.get_upcoming(NOW)], ["work-1", "home-1", "work-2"])
+        self.assertEqual([e.uid for e in self.store.get_upcoming(NOW, calendar_ids={"work"})],
+                         ["work-1", "work-2"])
+        self.assertEqual(self.store.get_next(NOW, calendar_ids={"home"}).uid, "home-1")
+        self.assertEqual(self.store.get_upcoming(NOW, calendar_ids=set()), [])
+        # The limit applies after filtering, not before it.
+        self.assertEqual([e.uid for e in self.store.get_upcoming(NOW, limit=1, calendar_ids={"work"})],
+                         ["work-1"])
+        self.assertEqual([e.uid for e in self.store.get_today(NOW, calendar_ids={"home"})], ["home-1"])
+
     def test_upcoming_ordering_and_filters(self):
         events = [
             ev("later", 120),

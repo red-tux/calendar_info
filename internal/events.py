@@ -14,6 +14,14 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from functools import lru_cache
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# Display timezone modes for the `display_timezone` plugin option. Anything else is taken as
+# an IANA zone name ("America/New_York").
+TZ_LOCAL = "local"
+TZ_EVENT = "event"
+TZ_UTC = "utc"
 
 STATUS_CONFIRMED = "CONFIRMED"
 STATUS_TENTATIVE = "TENTATIVE"
@@ -66,6 +74,36 @@ def local_tz() -> tzinfo:
     return datetime.now().astimezone().tzinfo
 
 
+@lru_cache(maxsize=64)
+def zone_by_name(name: str) -> tzinfo | None:
+    """An IANA zone, or None if the name is unknown (missing tzdata, or a bad TZID)."""
+    if not name:
+        return None
+    if name.upper() == "UTC":
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def resolve_tz(mode: str | None, event: "CalendarEvent | None" = None) -> tzinfo:
+    """The timezone times should be displayed in.
+
+    `mode` is TZ_LOCAL (the machine's zone), TZ_UTC, TZ_EVENT (the zone the event was created
+    in, from its ics TZID or Google timeZone) or an IANA name. Anything unresolvable falls back
+    to the machine's zone rather than silently showing the wrong hour in UTC.
+    """
+    if mode == TZ_UTC:
+        return timezone.utc
+    if mode == TZ_EVENT:
+        zone = zone_by_name(event.tzid) if event is not None else None
+        return zone or local_tz()
+    if mode and mode != TZ_LOCAL:
+        return zone_by_name(mode) or local_tz()
+    return local_tz()
+
+
 def as_utc(value: datetime) -> datetime:
     """Aware UTC datetime. Naive input is taken as local time (floating iCalendar times)."""
     if value.tzinfo is None:
@@ -87,6 +125,7 @@ class CalendarEvent:
     meeting_link: str | None = None
     status: str = STATUS_CONFIRMED
     series_uid: str = ""      # the iCalendar UID this instance came from
+    tzid: str = ""            # IANA zone the event was authored in, for the "event" display mode
     # Filled in by the foreground from the calendar's configuration, never by the backend.
     calendar_name: str = ""
     color: tuple[int, int, int, int] | None = None
@@ -143,6 +182,7 @@ class CalendarEvent:
             "url": self.url,
             "meeting_link": self.meeting_link,
             "status": self.status,
+            "tzid": self.tzid,
         }
 
     @classmethod
@@ -172,6 +212,7 @@ class CalendarEvent:
             url=data.get("url"),
             meeting_link=data.get("meeting_link"),
             status=data.get("status") or STATUS_CONFIRMED,
+            tzid=data.get("tzid") or "",
         )
 
 
@@ -184,6 +225,7 @@ class CalendarStatus:
     fetched_at: datetime | None = None
     from_cache: bool = False
     event_count: int = 0
+    needs_reauth: bool = False   # the source's stored authorization was rejected
 
     def to_dict(self) -> dict:
         return {
@@ -193,6 +235,7 @@ class CalendarStatus:
             "fetched_at": self.fetched_at.isoformat() if self.fetched_at else None,
             "from_cache": self.from_cache,
             "event_count": self.event_count,
+            "needs_reauth": self.needs_reauth,
         }
 
     @classmethod
@@ -205,6 +248,7 @@ class CalendarStatus:
             fetched_at=datetime.fromisoformat(fetched) if fetched else None,
             from_cache=bool(data.get("from_cache")),
             event_count=int(data.get("event_count", 0)),
+            needs_reauth=bool(data.get("needs_reauth")),
         )
 
 
@@ -260,19 +304,33 @@ def format_clock(value: datetime, time_format: str = "auto", tz: tzinfo | None =
     return f"{local.hour:02d}:{local.minute:02d}"
 
 
-def format_day(value: datetime, now: datetime, tz: tzinfo | None = None) -> str:
-    """"Today", "Tomorrow", else weekday abbreviation ("Mon"), else "Sep 14" beyond a week."""
-    tz = tz or local_tz()
-    day = value.astimezone(tz).date()
-    today = now.astimezone(tz).date()
+def _day_label(day: date, today: date) -> str:
     delta = (day - today).days
     if delta == 0:
         return "Today"
     if delta == 1:
         return "Tomorrow"
     if 1 < delta < 7:
-        return value.astimezone(tz).strftime("%a")
-    return value.astimezone(tz).strftime("%b %-d")
+        return day.strftime("%a")
+    return day.strftime("%b %-d")
+
+
+def format_day(value: datetime, now: datetime, tz: tzinfo | None = None) -> str:
+    """"Today", "Tomorrow", else weekday abbreviation ("Mon"), else "Sep 14" beyond a week."""
+    tz = tz or local_tz()
+    return _day_label(value.astimezone(tz).date(), now.astimezone(tz).date())
+
+
+def format_event_day(event: CalendarEvent, now: datetime, tz: tzinfo | None = None) -> str:
+    """Like format_day, but an all-day event keeps its own date.
+
+    All-day events are pinned to midnight in the *machine's* zone by `from_dict`, so
+    converting them into a different display zone would shift them a day. Their date is
+    absolute anyway - only "today" has to be evaluated in the display zone.
+    """
+    tz = tz or local_tz()
+    day = event.start.date() if event.all_day else event.start.astimezone(tz).date()
+    return _day_label(day, now.astimezone(tz).date())
 
 
 def format_start(event: CalendarEvent, now: datetime, time_format: str = "auto", tz: tzinfo | None = None) -> str:
@@ -280,7 +338,7 @@ def format_start(event: CalendarEvent, now: datetime, time_format: str = "auto",
     All-day events show the day ("Today", "Tomorrow", "Fri")."""
     tz = tz or local_tz()
     if event.all_day:
-        return format_day(event.start, now, tz)
+        return format_event_day(event, now, tz)
     same_day = event.start.astimezone(tz).date() == now.astimezone(tz).date()
     if same_day:
         return format_clock(event.start, time_format, tz)
