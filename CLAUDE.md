@@ -139,6 +139,41 @@ verified one commits the project to brand review and re-verification.
   open, and the settings UI polls `google_poll_auth` until it reports `ok`/`error`. Tokens never
   cross to the foreground - only the account id and address do.
 
+### Next milestones: GNOME Online Accounts
+
+Development moves to a GNOME desktop. Two milestones, in order: **GNOME + Google**, then
+**GNOME + Nextcloud**. GOA suits the registries better than KDE did, and `gir1.2-goa-1.0` is
+already installed in the dev container (`DESKTOP_ACCOUNTS=1`) and importable from the backend
+venv. Verified against the installed typelib (there is no GOA daemon in the container, so
+treat exact *property* names as unchecked):
+
+- `Goa.Client.new_sync()` → `get_accounts()` → a list of `Goa.Object`.
+- `Goa.Object.get_calendar()` returns the Calendar interface or None, so **capability is
+  discoverable** - `gnome.py` needs no equivalent of the KDE `PROVIDER_KINDS` table, which
+  only exists because kaccounts ships no calendar service.
+- `Goa.Object.get_oauth2_based().call_get_access_token_sync()` → bearer token (Google).
+- `Goa.Object.get_password_based().call_get_password_sync()` → basic credentials (Nextcloud).
+- `Goa.Object.get_account()` carries the identity; `get_exchange()` and `get_files()` exist too.
+
+**Milestone 1 (Google)** is `backend/accounts/gnome.py` plus a `registry.py` entry and nothing
+else: `GoogleSource` already reads any account whose kind is `google`, whoever hands over the
+token. `required_permissions()` returns the one bus name `org.gnome.OnlineAccounts` and no
+filesystem paths - GOA is pure D-Bus, with no account database to reach, unlike KDE.
+`check_access()` should probe that same name.
+
+**Milestone 2 (Nextcloud)** additionally needs the CalDAV source that does not exist yet: a
+`CalDavSource` with `account_kinds = ("dav",)`, which lights up the `dav` accounts discovery
+already reports as "support is not built yet". It consumes a `KIND_BASIC` credential, which
+`accounts/base.py` already models and both desktop providers can produce. It is the first
+source needing a new `backend_requirements.txt` entry (or raw `PROPFIND`/`REPORT` over
+`requests`), and it can reuse `ics_source.expand_events` on each returned VEVENT.
+
+**Dev container:** `.devcontainer/kde/` mounts `/usr/share/accounts` and
+`~/.config/libaccounts-glib`, neither of which exists on a GNOME host, so that config will
+refuse to start there. A GNOME variant is the KDE one minus both mounts and the `AG_*`
+variables, keeping `DESKTOP_ACCOUNTS=1` and `CALENDAR_INFO_ACCOUNTS_DBUS_ADDRESS` (GOA lives on
+the host session bus). The default config is unaffected and keeps working.
+
 ### Entry points
 
 - `main.py` - `CalendarInfoPlugin(PluginBase)`. Builds the shared `EventStore`, caches plugin

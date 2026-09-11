@@ -16,6 +16,12 @@ switch to this scheme.
 the container runs on. Working on this repo from two different computers never shares anything
 between them - each machine has its own daemon and its own `calendar-info-claude-shared` volume.
 
+The same follows for Claude Code's **memory**, which lives in that volume
+(`~/.claude/projects/<project>/memory/`): it is per-machine, and does not follow the repository
+to another computer. Anything a future session must know on *any* machine belongs in
+`CLAUDE.md`, which travels with the git clone - memory is for what is true of this machine and
+this working relationship.
+
 **The gap** is a fixed literal name has no notion of *which user* or *which checkout* it belongs
 to. That only matters if the same Docker daemon is shared by more than one person or more than
 one clone of this repo - e.g. a persistent workstation or bare-metal server that multiple
