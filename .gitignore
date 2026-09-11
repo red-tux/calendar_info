@@ -225,3 +225,8 @@ cache/
 credentials/
 
 .devcontainer/devcontainer-lock.json
+
+# Claude Code's per-machine settings, and the temp files it writes them through - a `git add -A`
+# mid-write otherwise sweeps one in. A shared .claude/settings.json would still be committable.
+.claude/settings.local.json
+.claude/*.tmp.*
