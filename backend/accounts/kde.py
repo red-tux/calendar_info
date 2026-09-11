@@ -127,6 +127,22 @@ class KdeAccountsProvider(AccountProvider):
         # copy of the auth parameters, and the XML is only an underlay for ones that don't.
         return {"dbus": [SIGNOND_NAME], "filesystem": []}
 
+    def check_access(self) -> tuple[bool, str]:
+        """Can this process reach signond? `queryMethods` is read-only, needs no account and
+        touches no login, so it answers the permission question and nothing else."""
+        try:
+            from gi.repository import Gio, GLib
+        except ImportError as e:
+            return False, f"PyGObject is not available to the backend: {e}"
+        try:
+            self._bus(Gio).call_sync(
+                SIGNOND_NAME, SIGNOND_PATH, SIGNOND_AUTH_SERVICE, "queryMethods",
+                None, GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE, _DBUS_TIMEOUT_MS, None)
+        except GLib.Error as e:
+            self._connection = None       # a refused connection must not be cached
+            return False, e.message
+        return True, ""
+
     # --- discovery ---------------------------------------------------------------------
 
     def list_accounts(self) -> list[AccountInfo]:

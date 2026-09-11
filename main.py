@@ -435,9 +435,15 @@ class CalendarInfoPlugin(PluginBase):
 
     # --- Flatpak sandbox permissions ----------------------------------------------------------
     #
-    # Desktop providers reach outside the sandbox (the desktop's token daemon on the session
-    # bus, its account database on disk). Both are `flatpak override --user` grants, no manifest
-    # change: the app already has a dialog for D-Bus names, none yet for filesystem paths.
+    # A desktop provider reaches outside the sandbox, to the session-bus service that hands out
+    # the desktop's logins. That is a `flatpak override --user` grant; the app's manifest is not
+    # involved. What is needed comes from each provider's own required_permissions(), never from
+    # a name written down here, so a second provider is covered as soon as it registers.
+    #
+    # The plugin shows its own dialog rather than calling PluginBase.request_dbus_permission():
+    # the app's has a "mark as solved" button that only closes the window, which says a
+    # permission is fixed without looking. Ours rechecks, and can tell a granted-but-not-yet-
+    # applied override from a working one.
 
     def is_flatpak(self) -> bool:
         manager = getattr(gl, "flatpak_permission_manager", None)
@@ -453,38 +459,80 @@ class CalendarInfoPlugin(PluginBase):
             log.warning(f"Could not read {provider} permissions: {e}")
             return {"dbus": [], "filesystem": []}
 
-    def missing_provider_permissions(self, provider: str) -> list[str]:
-        """`flatpak override` lines for what this provider needs and the sandbox has not been
-        granted; empty outside a Flatpak, where nothing is sandboxed. Reports only - nothing is
-        requested, so this is safe to call from a worker thread (it shells out to
-        `flatpak info`)."""
-        if not self.is_flatpak():
+    def list_providers(self) -> list[dict]:
+        """Every account provider the backend registered, so nothing in the UI has to name one.
+        Blocking; call from a worker thread."""
+        if self.backend is None:
             return []
-        manager = gl.flatpak_permission_manager
-        needed = self.provider_permissions(provider)
-        commands = [manager.get_dbus_permission_add_command(name, "session")
-                    for name in (needed.get("dbus") or [])
-                    if not manager.has_dbus_permission(name, "session")]
-        paths = needed.get("filesystem") or []
-        if paths:
-            commands.append("flatpak override --user "
-                            + " ".join(f"--filesystem={p}" for p in paths)
-                            + f" {manager.app_id}")
-        return commands
+        try:
+            return json.loads(self.backend.list_providers()).get("providers") or []
+        except Exception as e:
+            log.warning(f"Could not list the account providers: {e}")
+            return []
 
-    def ensure_provider_permissions(self, provider: str) -> list[str]:
-        """Main thread, Flatpak only. Asks for each missing D-Bus name through the app's own
-        permission dialog, then reports whatever is still missing - that dialog can be
-        dismissed, and the app has no dialog at all for filesystem paths."""
+    def desktop_providers(self) -> list[str]:
+        """Providers whose accounts come from the desktop - the ones that can need a sandbox
+        permission. Derived, never hardcoded, so a new one is covered as soon as it registers."""
+        return [p["id"] for p in self.list_providers() if p.get("discoverable")]
+
+    def permission_status(self, provider: str = "") -> dict:
+        """What the sandbox still owes one provider, or every desktop one.
+
+        Returns {"state", "commands", "message"} where state is:
+          "ok"      - granted, and this process can reach the service
+          "restart" - granted, but a `flatpak override` only applies when the sandbox is next
+                      set up, so this session still cannot use it
+          "missing" - not granted; `commands` says what to run
+
+        Reports only - nothing is requested and no dialog shown - so it is safe on a worker
+        thread, which it needs to be: it shells out to `flatpak info` and calls the backend.
+
+        The "restart" state is the reason the provider is asked whether it can reach its
+        service *now*, rather than trusting the override alone: `flatpak info` reflects the
+        override file the moment it is written, so checking that by itself would report a
+        permission as working while the running app still cannot use it.
+        """
         if not self.is_flatpak():
-            return []
+            return {"state": "ok", "commands": [], "message": ""}
         manager = gl.flatpak_permission_manager
-        for name in self.provider_permissions(provider).get("dbus") or []:
-            if not manager.has_dbus_permission(name, "session"):
-                self.request_dbus_permission(
-                    name, "session",
-                    f"Calendar Info needs to talk to {name} to use the accounts set up in your desktop.")
-        return self.missing_provider_permissions(provider)
+        commands, blocked = [], []
+        for name in ([provider] if provider else self.desktop_providers()):
+            needed = self.provider_permissions(name)
+            for bus_name in needed.get("dbus") or []:
+                if manager.has_dbus_permission(bus_name, "session"):
+                    continue
+                command = manager.get_dbus_permission_add_command(bus_name, "session")
+                if command not in commands:
+                    commands.append(command)
+            paths = needed.get("filesystem") or []
+            if paths:
+                command = ("flatpak override --user "
+                           + " ".join(f"--filesystem={p}" for p in paths) + f" {manager.app_id}")
+                if command not in commands:
+                    commands.append(command)
+            if not self._provider_reachable(name):
+                blocked.append(name)
+
+        if commands:
+            return {"state": "missing", "commands": commands,
+                    "message": f"Run {'this' if len(commands) == 1 else 'these'} in a terminal, "
+                               "then restart StreamController. A permission granted while the "
+                               "app is running does not reach it until the next start."}
+        if blocked:
+            return {"state": "restart", "commands": [],
+                    "message": "The permission is granted, but this session started without it. "
+                               "Restart StreamController to pick it up."}
+        return {"state": "ok", "commands": [],
+                "message": "StreamController can reach your desktop's login service."}
+
+    def _provider_reachable(self, provider: str) -> bool:
+        if self.backend is None:
+            return False
+        try:
+            return bool(json.loads(self.backend.check_provider_access(provider)).get("ok"))
+        except Exception as e:
+            log.warning(f"Could not check {provider} access: {e}")
+            return False
 
     def google_start_auth(self, client_id: str, client_secret: str) -> dict:
         """Ask the backend to open a consent flow. Returns {"ok", "flow_id", "auth_url", "error"}."""

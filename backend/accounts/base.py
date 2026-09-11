@@ -73,3 +73,12 @@ class AccountProvider:
         """Flatpak sandbox permissions the provider needs beyond the app's own:
         {"dbus": [session bus names], "filesystem": [paths, with :ro where enough]}."""
         return {"dbus": [], "filesystem": []}
+
+    def check_access(self) -> tuple[bool, str]:
+        """Whether what this provider talks to can be reached *right now*, and why not.
+
+        A granted `flatpak override` only takes effect when the sandbox is next set up, so
+        checking the override alone would call a permission working while this process still
+        cannot use it. Providers that talk to nothing are always reachable.
+        """
+        return True, ""

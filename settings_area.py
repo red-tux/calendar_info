@@ -335,13 +335,12 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
     def _load_add_options(self) -> None:
         sources = self.plugin_base.describe_sources()
         discovered = self.plugin_base.list_desktop_accounts()
-        # Reporting only - asking would pop the app's permission dialog at someone who may
-        # only want to paste an .ics address.
-        missing = self.plugin_base.missing_provider_permissions("kde")
-        GLib.idle_add(self._populate_add_dialog, sources, discovered, missing)
+        # Every desktop provider, not a name written down here.
+        permissions = self.plugin_base.permission_status()
+        GLib.idle_add(self._populate_add_dialog, sources, discovered, permissions)
 
     def _populate_add_dialog(self, sources: list[dict], discovered: dict,
-                             missing: list[str]) -> None:
+                             permissions: dict) -> None:
         if self._add_dialog is None:
             return
         page = Adw.PreferencesPage()
@@ -371,17 +370,16 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
                 "No accounts found. Add one in System Settings → Online Accounts, or use a "
                 "manual option below.")
             desktop.add(Adw.ActionRow(title="Nothing to link", subtitle=_escape(message), subtitle_lines=3))
-        if missing:
+        if permissions.get("state", "ok") != "ok":
             # Discovery only reads a file, so accounts can be listed while the login service is
             # still out of reach - say so here rather than at the first failed token request.
             row = Adw.ActionRow(
-                title="One permission is still needed",
-                subtitle="StreamController's sandbox cannot reach the service that hands out "
-                         "your desktop's logins yet.",
+                title="A permission is still needed",
+                subtitle=_escape(permissions.get("message") or ""),
                 subtitle_lines=3,
             )
-            button = Gtk.Button(label="Show command", valign=Gtk.Align.CENTER)
-            button.connect("clicked", lambda *a: self._show_permission_commands(missing))
+            button = Gtk.Button(label="Details", valign=Gtk.Align.CENTER)
+            button.connect("clicked", lambda *a: self._show_permission_dialog())
             row.add_suffix(button)
             desktop.add(row)
         page.add(desktop)
@@ -574,7 +572,6 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
     # --- add: an account the desktop already has ------------------------------------------------
 
     def _link_desktop_account(self, account: dict) -> None:
-        self.plugin_base.ensure_provider_permissions(account["provider"])
         self._close_add_dialog()
         self.status_label.set_label(f"Linking {_account_title(account)}…")
         threading.Thread(target=self._link_desktop_thread, args=(account,),
@@ -605,24 +602,67 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             self._show_calendar_picker(linked, result)
         else:
             self.status_label.set_label(f"Linked, but the desktop login failed: {result.get('error')}")
-            self._show_permission_commands(self.plugin_base.ensure_provider_permissions(account["provider"]))
+            self._show_permission_dialog(account["provider"])
 
-    def _show_permission_commands(self, commands: list[str]) -> None:
-        """A Flatpak hides the desktop's login service until the user grants the bus name. The
-        app's own dialog asks for it, but it can be dismissed - and nothing asks for filesystem
-        paths - so whatever is still missing is shown as a command to run."""
-        if not commands:
-            return
-        dialog = Adw.AlertDialog(
-            heading="Let StreamController reach your desktop accounts",
-            body=("StreamController runs in a Flatpak sandbox, which hides the service that "
-                  "hands out your desktop's logins. Run this once in a terminal, then restart "
-                  "StreamController:"),
+    def _show_permission_dialog(self, provider: str = "") -> None:
+        """A Flatpak hides the desktop's login service until the bus name is granted.
+
+        Recheck really rechecks: it re-reads the sandbox's permissions and asks the backend
+        whether it can reach the service *now*, so a granted-but-not-yet-applied override is
+        reported as needing a restart rather than being called fixed. A plain Adw.Dialog
+        rather than an AlertDialog, because any AlertDialog response closes it.
+        """
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            title="Permissions",
+            description="StreamController runs in a Flatpak sandbox, which hides the service "
+                        "that hands out your desktop's logins until it is allowed through.",
         )
-        dialog.set_extra_child(Gtk.Label(label="\n".join(commands), selectable=True, wrap=True,
-                                         xalign=0, css_classes=["monospace"]))
-        dialog.add_response("ok", "OK")
+        self._permission_command_row = Adw.ActionRow(title="", subtitle_lines=4)
+        copy_button = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER,
+                                 tooltip_text="Copy")
+        copy_button.connect("clicked", lambda *a: self._copy_permission_command())
+        self._permission_command_row.add_suffix(copy_button)
+        group.add(self._permission_command_row)
+
+        self._permission_status_row = Adw.ActionRow(title="", subtitle_lines=3)
+        group.add(self._permission_status_row)
+        page.add(group)
+
+        recheck_button = Gtk.Button(label="Recheck", css_classes=["suggested-action"])
+        recheck_button.connect("clicked", lambda *a: self._recheck_permissions(provider))
+        dialog = Adw.Dialog(title="Permissions", child=_with_header(page, recheck_button),
+                            content_width=620, content_height=380)
+        self._permission_commands: list[str] = []
+        self._render_permission_status(self.plugin_base.permission_status(provider))
         dialog.present(self)
+
+    def _recheck_permissions(self, provider: str) -> None:
+        self._permission_status_row.set_title("Rechecking…")
+        self._permission_status_row.set_subtitle("")
+        threading.Thread(target=self._recheck_permissions_thread, args=(provider,),
+                         name="calendar_permission_recheck", daemon=True).start()
+
+    def _recheck_permissions_thread(self, provider: str) -> None:
+        status = self.plugin_base.permission_status(provider)
+        GLib.idle_add(self._render_permission_status, status)
+
+    def _render_permission_status(self, status: dict) -> None:
+        titles = {"ok": "Working", "restart": "Restart StreamController",
+                  "missing": "Not granted yet"}
+        self._permission_commands = status.get("commands") or []
+        self._permission_command_row.set_visible(bool(self._permission_commands))
+        if self._permission_commands:
+            self._permission_command_row.set_title("Run in a terminal")
+            self._permission_command_row.set_subtitle(
+                _escape("\n".join(self._permission_commands)))
+        self._permission_status_row.set_title(titles.get(status.get("state"), "Not granted yet"))
+        self._permission_status_row.set_subtitle(_escape(status.get("message") or ""))
+
+    def _copy_permission_command(self) -> None:
+        display = Gdk.Display.get_default()
+        if display is not None and self._permission_commands:
+            display.get_clipboard().set("\n".join(self._permission_commands))
 
     # --- an account's calendars ------------------------------------------------------------------
 

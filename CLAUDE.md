@@ -121,7 +121,12 @@ verified one commits the project to brand review and re-verification.
   calendars". A password-method account (Nextcloud) returns a basic credential, ready for a
   future CalDAV source; note `_auth_data_via_db` reads only account-global settings
   (`service = 0`), so that source will also need the service-scoped `dav/host` rows.
-  `required_permissions()` lists the Flatpak grants.
+  `required_permissions()` lists the Flatpak grants - **one bus name covers every account
+  kind**, since signond is the single broker for all of them (the other SSO-ish names on the
+  session bus are `com.nokia.singlesignonui`, which `UiPolicy=2` avoids, and KWallet, which
+  signond talks to rather than us), so an Exchange provider would need nothing new here.
+  `check_access()` probes that name with `AuthService.queryMethods` - read-only, no account
+  touched - to tell a granted-but-not-yet-applied override from a working one.
 - `backend/google_source.py` - `TokenStore` (one 0600 JSON file per account under
   `credentials/`, created 0600 rather than chmod-ed afterwards), `GoogleClient` (takes a
   provider + account id, one forced-refresh retry on a 401, error mapping) and `map_event()`,
@@ -173,16 +178,21 @@ verified one commits the project to brand review and re-verification.
   calendars once to learn its address (the primary calendar's id), links even if that first
   token request fails so *Add calendars* can retry, and then opens the calendar picker - linking
   is only half the job.
-- Flatpak grants for desktop providers are driven by each provider's `required_permissions()`.
-  `missing_provider_permissions()` *reports* what the sandbox lacks (safe on a worker thread -
-  it shells out to `flatpak info`), and `ensure_provider_permissions()` additionally asks for
-  each missing D-Bus name through the app's `request_dbus_permission()` dialog. Whatever is
-  still missing comes back as `flatpak override --user` lines that the UI shows
-  (`_show_permission_commands`) - the dialog can be dismissed, and the app has none at all for
-  filesystem paths. The add dialog reports missing grants up front rather than waiting for a
-  token request to fail with a raw D-Bus error: discovery only reads a file, so accounts list
-  fine while the login service is still out of reach. User-level overrides either way; the
-  app's manifest is not touched. The KDE provider needs only the bus name -
+- Flatpak grants for desktop providers are driven by each provider's `required_permissions()`;
+  nothing in the UI names a provider, `desktop_providers()` derives them from
+  `backend.list_providers()`. `permission_status()` returns one of three states - `missing`
+  (with the `flatpak override --user` lines to run), `restart`, or `ok` - and the UI renders it
+  in its own dialog whose **Recheck** button re-runs the whole check. **`flatpak info` reflects
+  an override the moment it is written, but the override only reaches the app when the sandbox
+  is next set up**, so checking it alone would report a permission as working while the running
+  process still cannot use it; that is what the providers' `check_access()` probe is for
+  (`AuthService.queryMethods` for KDE - read-only, no account touched) and what the `restart`
+  state means. The plugin deliberately does *not* use `PluginBase.request_dbus_permission()`:
+  the app's dialog has a "mark as solved" button whose handler only calls `destroy()`.
+  The add dialog reports missing grants up front rather than waiting for a token request to
+  fail with a raw D-Bus error, since discovery only reads a file and lists accounts fine while
+  the login service is still out of reach. User-level overrides throughout; the app's manifest
+  is not touched. The KDE provider needs only the bus name -
   the account database is under the user's home, already covered by the manifest's
   `--filesystem=home`. **A Flatpak redirects `XDG_CONFIG_HOME` to `~/.var/app/<id>/config`**,
   so `candidate_db_paths()` falls back to the real `~/.config`; trusting the variable alone

@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest import mock
 
-from backend.accounts.base import KIND_BASIC, KIND_BEARER
+from backend.accounts.base import KIND_BASIC, KIND_BEARER, AccountProvider
 from backend.accounts.kde import (
     SIGNOND_NAME,
     KdeAccountsProvider,
@@ -183,6 +183,19 @@ class FallbackTests(unittest.TestCase):
 
     def test_discoverable(self):
         self.assertTrue(self.provider.discoverable)
+
+    def test_check_access_reports_why_it_cannot_reach_signond(self):
+        # What distinguishes "granted but this session started without it" from "working" -
+        # a flatpak override applies only at sandbox setup, so the override file existing is
+        # not evidence that the running process can use it.
+        unreachable = KdeAccountsProvider(db_path=self.db_path, bus_address="unix:path=/nonexistent/bus",
+                                          use_gi=False)
+        ok, error = unreachable.check_access()
+        self.assertFalse(ok)
+        self.assertTrue(error)
+
+    def test_a_provider_that_talks_to_nothing_is_always_reachable(self):
+        self.assertEqual(AccountProvider().check_access(), (True, ""))
 
     def test_auth_data_from_account_settings(self):
         credentials_id, method, mechanism, params = self.provider._auth_data("1")

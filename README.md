@@ -96,14 +96,17 @@ Accounts of a kind Calendar Info cannot read yet - a Nextcloud account, say - ar
 too, greyed out and labelled with what is missing, so you can see what a future version will
 pick up.
 
-On the Flatpak build of StreamController, the sandbox hides the desktop's login service, so the
-first time you link an account the plugin asks for that permission through StreamController's
-own dialog. If you would rather grant it up front, or the dialog does not appear:
+On the Flatpak build of StreamController, the sandbox hides the desktop's login service. The
+plugin says so when you open *Calendar sources → +* and gives you the command; you can also run
+it up front:
 
 ```sh
 flatpak override --user --talk-name=com.google.code.AccountsSSO.SingleSignOn com.core447.StreamController
-flatpak kill com.core447.StreamController      # overrides only apply at sandbox setup
 ```
+
+**Then restart StreamController.** A Flatpak reads its permissions when it starts, so one
+granted while the app is running does not reach it until the next launch - the plugin's
+*Recheck* button will say so rather than pretend the problem is solved.
 
 Nothing else is needed: the account database lives under your home directory, which
 StreamController's manifest already grants access to, and nothing in its packaging changes.

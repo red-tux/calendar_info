@@ -150,6 +150,33 @@ class CalendarBackend(BackendBase):
         except SourceError:
             return json.dumps({"dbus": [], "filesystem": []})
 
+    def list_providers(self) -> str:
+        """Every registered provider, so the foreground never has to name one itself. JSON
+        {"providers": [{"id", "discoverable", "available", "permissions"}]}."""
+        providers = []
+        for provider_id, provider in self._providers.items():
+            try:
+                available = provider.available()
+            except Exception:
+                log.exception(f"Checking whether {provider_id} is available failed")
+                available = False
+            providers.append({"id": provider_id, "discoverable": provider.discoverable,
+                              "available": available,
+                              "permissions": provider.required_permissions()})
+        return json.dumps({"providers": providers})
+
+    def check_provider_access(self, provider: str) -> str:
+        """Whether this process can reach what the provider talks to right now. JSON
+        {"ok", "error"}."""
+        try:
+            ok, error = self._provider(provider).check_access()
+        except SourceError as e:
+            return json.dumps({"ok": False, "error": str(e)})
+        except Exception as e:
+            log.exception(f"Checking access for {provider} failed")
+            return json.dumps({"ok": False, "error": f"{e.__class__.__name__}: {e}"})
+        return json.dumps({"ok": ok, "error": error})
+
     def on_disconnect(self, conn):
         self._stop.set()
         self._wake.set()
