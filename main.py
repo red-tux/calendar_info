@@ -49,6 +49,9 @@ DEFAULT_CALENDAR_COLOR = (66, 133, 244, 255)
 CALENDAR_TYPE_ICS = "ics"
 CALENDAR_TYPE_GOOGLE = "google"
 CALENDAR_TYPES = (CALENDAR_TYPE_ICS, CALENDAR_TYPE_GOOGLE)
+# The provider of a calendar's `account_id` (backend/accounts/registry.py). Entries written
+# before providers existed have none and are OAuth ones.
+DEFAULT_ACCOUNT_PROVIDER = "oauth"
 
 
 @dataclass
@@ -213,11 +216,11 @@ class CalendarInfoPlugin(PluginBase):
 
     def get_calendars(self) -> list[dict]:
         """Configured calendars, normalized to
-        {id, name, type, source, account_id, google_calendar, enabled, color}.
+        {id, name, type, source, account_provider, account_id, google_calendar, enabled, color}.
 
         `type` is "ics" (an address or file in `source`) or "google" (the Google calendar id in
-        `google_calendar`, read through the account in `account_id`). Entries written before the
-        Google source existed have no type and default to "ics".
+        `google_calendar`, read through the account `account_id` of `account_provider`). Entries
+        written before the Google source existed have no type and default to "ics".
         """
         calendars = []
         for raw in self.get_settings().get("calendars", []) or []:
@@ -230,6 +233,7 @@ class CalendarInfoPlugin(PluginBase):
                 "name": str(raw.get("name") or "Calendar"),
                 "type": calendar_type if calendar_type in CALENDAR_TYPES else CALENDAR_TYPE_ICS,
                 "source": str(raw.get("source") or ""),
+                "account_provider": str(raw.get("account_provider") or DEFAULT_ACCOUNT_PROVIDER),
                 "account_id": str(raw.get("account_id") or ""),
                 "google_calendar": str(raw.get("google_calendar") or ""),
                 "enabled": bool(raw.get("enabled", True)),
@@ -268,8 +272,8 @@ class CalendarInfoPlugin(PluginBase):
         return json.dumps({
             "calendars": [
                 {"id": c["id"], "name": c["name"], "type": c["type"], "source": c["source"],
-                 "account_id": c["account_id"], "google_calendar": c["google_calendar"],
-                 "enabled": c["enabled"]}
+                 "account_provider": c["account_provider"], "account_id": c["account_id"],
+                 "google_calendar": c["google_calendar"], "enabled": c["enabled"]}
                 for c in self.get_calendars()
             ],
             "refresh_seconds": self.options.refresh_minutes * 60,
@@ -303,15 +307,21 @@ class CalendarInfoPlugin(PluginBase):
         if self.backend is None:
             return {"ok": False, "count": 0, "error": "Calendar backend is still starting, try again in a moment", "sample": []}
         try:
-            return json.loads(self.backend.test_source(source))
+            return json.loads(self.backend.test_source(
+                json.dumps({"type": CALENDAR_TYPE_ICS, "source": source})))
         except Exception as e:
             return {"ok": False, "count": 0, "error": str(e), "sample": []}
 
-    # --- Google account ----------------------------------------------------------------------
+    # --- accounts ----------------------------------------------------------------------------
     #
-    # Modelled on Home Assistant's application_credentials: the plugin ships no OAuth client of
-    # its own, each user registers one in their own Google Cloud project and pastes it in here.
-    # That keeps every install outside Google's verification, brand review and shared quota.
+    # An account is {provider, id, label, email}; the provider (backend/accounts/) is what turns
+    # the id into a credential. Secrets are never in the settings: OAuth refresh tokens live in
+    # `credentials_dir` (written by the backend), desktop providers keep theirs in the desktop.
+    #
+    # The OAuth provider is modelled on Home Assistant's application_credentials: the plugin
+    # ships no OAuth client of its own, each user registers one in their own Google Cloud project
+    # and pastes it in here. That keeps every install outside Google's verification, brand
+    # review and shared quota.
 
     def get_google_credentials(self) -> dict:
         """{"client_id", "client_secret"} - the user's own Cloud project OAuth client."""
@@ -330,44 +340,79 @@ class CalendarInfoPlugin(PluginBase):
         self.set_settings(settings)
         self.on_settings_changed()
 
-    def get_google_accounts(self) -> list[dict]:
-        """Linked accounts as [{"id", "email"}]. Refresh tokens are not here - they live in
-        `credentials_dir`, written by the backend."""
-        google = self.get_settings().get("google") or {}
-        accounts = []
-        for raw in google.get("accounts") or []:
-            if isinstance(raw, dict) and raw.get("id"):
-                accounts.append({"id": str(raw["id"]), "email": str(raw.get("email") or "")})
+    def get_accounts(self) -> list[dict]:
+        """Linked accounts as [{"provider", "id", "label", "email"}]. Accounts saved before
+        providers existed sit under google.accounts and are OAuth ones; they are read here and
+        rewritten in the new place on the next change."""
+        settings = self.get_settings()
+        raw_accounts = list(settings.get("accounts") or [])
+        legacy = (settings.get("google") or {}).get("accounts") or []
+        raw_accounts += [dict(a, provider=DEFAULT_ACCOUNT_PROVIDER) for a in legacy if isinstance(a, dict)]
+        accounts, seen = [], set()
+        for raw in raw_accounts:
+            if not isinstance(raw, dict) or not raw.get("id"):
+                continue
+            key = (str(raw.get("provider") or DEFAULT_ACCOUNT_PROVIDER), str(raw["id"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            accounts.append({"provider": key[0], "id": key[1],
+                             "label": str(raw.get("label") or ""), "email": str(raw.get("email") or "")})
         return accounts
 
-    def _set_google_accounts(self, accounts: list[dict]) -> None:
-        settings = self.get_settings()
+    def _write_accounts(self, settings: dict, accounts: list[dict]) -> None:
+        settings["accounts"] = accounts
         google = dict(settings.get("google") or {})
-        google["accounts"] = accounts
+        google.pop("accounts", None)
         settings["google"] = google
+
+    def add_account(self, provider: str, account_id: str, label: str = "", email: str = "") -> None:
+        # Re-linking the same OAuth account gets a fresh id but the same address; desktop
+        # providers' ids are stable. Either way the old entry goes.
+        accounts = [a for a in self.get_accounts()
+                    if a["provider"] != provider or (a["id"] != account_id and not (email and a["email"] == email))]
+        accounts.append({"provider": provider, "id": account_id, "label": label, "email": email})
+        settings = self.get_settings()
+        self._write_accounts(settings, accounts)
         self.set_settings(settings)
         self.on_settings_changed()
 
-    def add_google_account(self, account_id: str, email: str) -> None:
-        accounts = [a for a in self.get_google_accounts() if a["email"] != email]
-        accounts.append({"id": account_id, "email": email})
-        self._set_google_accounts(accounts)
-
-    def remove_google_account(self, account_id: str) -> None:
-        """Drop the account, its stored token, and every calendar that was reading through it."""
+    def remove_account(self, provider: str, account_id: str) -> None:
+        """Drop the account, whatever its provider stored for it, and every calendar that was
+        reading through it."""
         if self.backend is not None:
             try:
-                self.backend.google_disconnect(account_id)
+                self.backend.forget_account(provider, account_id)
             except Exception as e:
-                log.warning(f"Could not revoke the Google token for {account_id}: {e}")
-        remaining = [c for c in self.get_calendars() if c["account_id"] != account_id]
+                log.warning(f"Could not forget {provider} account {account_id}: {e}")
+        remaining = [c for c in self.get_calendars()
+                     if not (c["account_provider"] == provider and c["account_id"] == account_id)]
+        accounts = [a for a in self.get_accounts()
+                    if not (a["provider"] == provider and a["id"] == account_id)]
         settings = self.get_settings()
         settings["calendars"] = remaining
-        google = dict(settings.get("google") or {})
-        google["accounts"] = [a for a in self.get_google_accounts() if a["id"] != account_id]
-        settings["google"] = google
+        self._write_accounts(settings, accounts)
         self.set_settings(settings)
         self.on_settings_changed()
+
+    def list_desktop_accounts(self) -> dict:
+        """Accounts the desktop providers can offer to link. Blocking; call from a worker
+        thread. {"ok", "accounts", "error"}."""
+        if self.backend is None:
+            return {"ok": False, "accounts": [], "error": "Calendar backend is still starting"}
+        try:
+            return json.loads(self.backend.list_accounts(""))
+        except Exception as e:
+            return {"ok": False, "accounts": [], "error": str(e)}
+
+    def list_calendars(self, calendar_type: str, provider: str, account_id: str) -> dict:
+        """Blocking; call from a worker thread. {"ok", "calendars", "error"}."""
+        if self.backend is None:
+            return {"ok": False, "calendars": [], "error": "Calendar backend is still starting"}
+        try:
+            return json.loads(self.backend.list_calendars(calendar_type, provider, account_id))
+        except Exception as e:
+            return {"ok": False, "calendars": [], "error": str(e)}
 
     def google_start_auth(self, client_id: str, client_secret: str) -> dict:
         """Ask the backend to open a consent flow. Returns {"ok", "flow_id", "auth_url", "error"}."""
@@ -394,15 +439,6 @@ class CalendarInfoPlugin(PluginBase):
             self.backend.google_cancel_auth(flow_id)
         except Exception as e:
             log.warning(f"Could not cancel the Google authorization: {e}")
-
-    def google_list_calendars(self, account_id: str) -> dict:
-        """Blocking; call from a worker thread. {"ok", "calendars", "error"}."""
-        if self.backend is None:
-            return {"ok": False, "calendars": [], "error": "Calendar backend is still starting"}
-        try:
-            return json.loads(self.backend.google_list_calendars(account_id))
-        except Exception as e:
-            return {"ok": False, "calendars": [], "error": str(e)}
 
     # --- called by the backend over RPyC -----------------------------------------------------
 

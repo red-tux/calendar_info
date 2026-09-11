@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+KIND_BEARER = "bearer"
+KIND_BASIC = "basic"
+
+
+@dataclass
+class Credential:
+    """What a source puts on the wire: a bearer token, or a username/password pair."""
+    kind: str
+    token: str = ""
+    username: str = ""
+    password: str = ""
+    expires_at: float = 0.0
+
+
+@dataclass
+class AccountInfo:
+    """An account a provider can offer to link. Never carries a secret."""
+    provider: str
+    id: str
+    label: str = ""
+    email: str = ""
+
+    def to_dict(self) -> dict:
+        return {"provider": self.provider, "id": self.id, "label": self.label, "email": self.email}
+
+
+class AccountProvider:
+    """Interface every provider implements; the backend keeps one instance per provider."""
+
+    provider_id = ""
+
+    def configure(self, config: dict) -> None:
+        """Called with the full backend configuration whenever it is (re)pushed."""
+
+    def available(self) -> bool:
+        """False when the provider can't work here (no desktop daemon, no library) - it is
+        then simply absent from discovery, which is what most users should see."""
+        return True
+
+    def list_accounts(self) -> list[AccountInfo]:
+        """Accounts this provider can offer to link. Desktop providers discover them; the
+        OAuth provider has nothing to discover (linking is its consent flow)."""
+        return []
+
+    def get_credential(self, account_id: str, force_refresh: bool = False) -> Credential:
+        raise NotImplementedError
+
+    def forget(self, account_id: str) -> None:
+        """Revoke/delete whatever this provider stored for the account. No-op if nothing."""
+
+    def required_permissions(self) -> dict:
+        """Flatpak sandbox permissions the provider needs beyond the app's own:
+        {"dbus": [session bus names], "filesystem": [paths, with :ro where enough]}."""
+        return {"dbus": [], "filesystem": []}

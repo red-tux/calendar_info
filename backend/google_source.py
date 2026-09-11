@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timezone
 
@@ -23,7 +22,7 @@ _PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
-from backend.google_oauth import AuthFlowError, refresh_access_token, revoke  # noqa: E402
+from backend.accounts.base import KIND_BEARER, AccountProvider  # noqa: E402
 from backend.source_errors import AuthError, SourceError  # noqa: E402
 from internal.events import (  # noqa: E402
     STATUS_CONFIRMED,
@@ -36,7 +35,6 @@ API_BASE = "https://www.googleapis.com/calendar/v3"
 DEFAULT_TIMEOUT = 20
 MAX_RESULTS = 250
 MAX_PAGES = 10
-_EXPIRY_SKEW_SECONDS = 60
 
 _STATUS_MAP = {"confirmed": "CONFIRMED", "tentative": "TENTATIVE", "cancelled": "CANCELLED"}
 
@@ -82,29 +80,17 @@ class TokenStore:
 
 @dataclass
 class GoogleClient:
-    """Authorized access to one linked account. Refreshes the access token as needed."""
-    client_id: str
-    client_secret: str
+    """Authorized access to one linked account. Where the token comes from - a refresh token
+    this plugin stores, the desktop's keyring - is the provider's business; the calls are the
+    same."""
+    provider: AccountProvider
     account_id: str
-    store: TokenStore
 
     def _access_token(self, force_refresh: bool = False) -> str:
-        data = self.store.load(self.account_id)
-        token = data.get("access_token") or ""
-        expires_at = float(data.get("expires_at") or 0)
-        if token and not force_refresh and time.time() < expires_at - _EXPIRY_SKEW_SECONDS:
-            return token
-        try:
-            fresh = refresh_access_token(self.client_id, self.client_secret, data["refresh_token"])
-        except AuthFlowError as e:
-            raise AuthError(str(e)) from e
-        data["access_token"] = fresh.get("access_token", "")
-        data["expires_at"] = time.time() + float(fresh.get("expires_in") or 3600)
-        # A rotated refresh token is only sent sometimes; keep the old one otherwise.
-        if fresh.get("refresh_token"):
-            data["refresh_token"] = fresh["refresh_token"]
-        self.store.save(self.account_id, data)
-        return data["access_token"]
+        credential = self.provider.get_credential(self.account_id, force_refresh=force_refresh)
+        if credential.kind != KIND_BEARER or not credential.token:
+            raise AuthError("The account provider returned no usable token for Google.")
+        return credential.token
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         url = f"{API_BASE}{path}"
@@ -297,15 +283,3 @@ def map_event(item: dict, calendar_key: str) -> CalendarEvent:
         status=_STATUS_MAP.get(str(item.get("status") or "").lower(), STATUS_CONFIRMED),
         tzid=tzid,
     )
-
-
-def disconnect(client_id: str, client_secret: str, account_id: str, store: TokenStore) -> None:
-    """Revoke what we can, then drop the stored token either way."""
-    try:
-        data = store.load(account_id)
-    except AuthError:
-        data = {}
-    token = data.get("refresh_token") or data.get("access_token")
-    if token:
-        revoke(token)
-    store.delete(account_id)

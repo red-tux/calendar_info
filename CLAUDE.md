@@ -35,9 +35,10 @@ pip install icalendar recurring-ical-events requests    # e.g. in a throwaway ve
 python3 -m unittest discover -s tests -t .
 ```
 
-`tests/` covers `internal/events.py`, `internal/event_store.py`, `backend/ics_source.py` and the
-pure parts of the Google path (`map_event`, `TokenStore`, the auth-URL construction and the OAuth
-error messages) - the consent flow itself needs a browser and a real client.
+`tests/` covers `internal/events.py`, `internal/event_store.py`, `backend/ics_source.py`, the
+two registries (`backend/sources.py`, `backend/accounts/`) and the pure parts of the Google path
+(`map_event`, `TokenStore`, `GoogleClient` against a fake provider, the auth-URL construction and
+the OAuth error messages) - the consent flow itself needs a browser and a real client.
 Anything that touches `src.backend...` / `GtkHelper` / `gi` (actions, main.py, settings_area.py)
 can only be exercised in the app.
 
@@ -48,23 +49,35 @@ can only be exercised in the app.
 - **Foreground** (`main.py`, `actions/`, `settings_area.py`, `internal/event_store.py`) runs in
   StreamController's own Python env. It may only use what the app's `requirements.txt` provides
   (PIL, requests, python-dateutil, GTK via gi, loguru...).
-- **Backend** (`backend/backend.py`, `backend/ics_source.py`, `backend/google_source.py`,
-  `backend/google_oauth.py`) runs in this plugin's own venv (`__install__.py` +
-  `backend_requirements.txt`: icalendar, recurring-ical-events, requests), because the app
-  doesn't ship an iCalendar parser. It polls every configured calendar, expands recurrences
-  into instances over a window (yesterday .. N days ahead), caches each one's last good result
-  under `cache/calendars/` (`.ics` text for feeds, mapped events as `.json` for the API), and
-  relays the result to the foreground.
+- **Backend** (`backend/backend.py`, `backend/sources.py`, `backend/accounts/`,
+  `backend/ics_source.py`, `backend/google_source.py`, `backend/google_oauth.py`) runs in this
+  plugin's own venv (`__install__.py` + `backend_requirements.txt`: icalendar,
+  recurring-ical-events, requests), because the app doesn't ship an iCalendar parser. It polls
+  every configured calendar, expands recurrences into instances over a window (yesterday .. N
+  days ahead), caches each one's last good result under `cache/calendars/` (`.ics` text for
+  feeds, mapped events as `.json` for the API), and relays the result to the foreground. The
+  one thing it borrows from the app is PyGObject (`gi`, for GDBus): `__install__.py` drops a
+  `.pth` into the venv naming the app interpreter's site-packages, *after* the venv's own, since
+  PyGObject has no wheels and the Flatpak runtime has no compiler to build it with.
 - `internal/events.py` is shared by both and must stay free of gi/StreamController imports.
-- **Two calendar sources, one event model.** A calendar entry's `type` is `ics` (an address or
-  file in `source`) or `google` (`account_id` + `google_calendar`). `backend.py::_poll_once`
-  dispatches on it; both paths produce `CalendarEvent`s, so nothing downstream - event_store,
-  the actions, rendering - knows which source an event came from. Add a source by adding a
-  module that returns `list[CalendarEvent]`, not by touching anything past the backend.
+- **Two registries, one event model.** A calendar entry names a *source* (`type`: `ics` for an
+  address or file in `source`, `google` for `google_calendar` read through an account) and,
+  where the source needs one, an *account provider* (`account_provider` + `account_id`;
+  `oauth` = the user's own Google OAuth client). `backend/sources.py::SOURCES` maps `type` to
+  a `CalendarSource` (`fetch`, `load_cached`, `list_calendars`); `backend/accounts/registry.py::PROVIDERS`
+  maps `account_provider` to an `AccountProvider` (`get_credential`, `list_accounts`,
+  `forget`, `required_permissions`). A source asks the calendar's provider for a `Credential`
+  (bearer token or username/password) and never learns where it came from; every source
+  produces `CalendarEvent`s, so nothing downstream - event_store, the actions, rendering -
+  knows which source or provider an event came from. **Adding a source (CalDAV) or a provider
+  (KDE/GNOME Online Accounts, a stored password) is one module plus one registry entry**; the
+  poll loop, the RPyC surface, `main.py`'s account bookkeeping and the settings list rendering
+  are keyed by these strings and must stay that way.
 
 **Everything crossing RPyC is JSON text** (`backend.configure(json)`, `frontend.on_events_update(json)`,
-`backend.test_source(...) -> json`): rpyc proxies dict/list arguments by reference, so field
-access on the other side would round-trip back across the connection.
+`backend.test_source(calendar_json) -> json`, `backend.list_accounts(provider) -> json`,
+`backend.list_calendars(type, provider, account_id) -> json`): rpyc proxies dict/list arguments
+by reference, so field access on the other side would round-trip back across the connection.
 
 ### Google Calendar API
 
@@ -80,11 +93,14 @@ verified one commits the project to brand review and re-verification.
   bounce because the browser is on a different machine than the instance; here it isn't, so the
   installed-app loopback flow applies and no redirect URI has to be registered at all.
   `describe_token_error()` maps Google's OAuth errors onto the setup step that was missed.
+- `backend/accounts/oauth_google.py` - the `oauth` provider: refresh-token handling on top of
+  `TokenStore`, revoke-and-delete on `forget()`.
 - `backend/google_source.py` - `TokenStore` (one 0600 JSON file per account under
-  `credentials/`, created 0600 rather than chmod-ed afterwards), `GoogleClient` (access-token
-  refresh, one forced-refresh retry on a 401, error mapping) and `map_event()`, which turns one
-  `events.list` item into a `CalendarEvent`. `singleEvents=true` means Google expands
-  recurrences, so `recurring-ical-events` is not involved on this path.
+  `credentials/`, created 0600 rather than chmod-ed afterwards), `GoogleClient` (takes a
+  provider + account id, one forced-refresh retry on a 401, error mapping) and `map_event()`,
+  which turns one `events.list` item into a `CalendarEvent`. `singleEvents=true` means Google
+  expands recurrences, so `recurring-ical-events` is not involved on this path. A Google
+  calendar linked through a desktop provider runs through exactly this code.
 - Account naming uses the primary calendar's id (which is the account's address) instead of
   adding a profile/email scope: the consent screen stays at `calendar.readonly` alone.
 - The flow is asynchronous across RPyC: `google_start_auth` returns a `flow_id` plus the URL to
@@ -151,9 +167,11 @@ guard), resets the render cache, and repaints. `on_disconnect()` unsubscribes an
 ### Settings scopes
 
 - **Plugin-level** (`PluginBase.get_settings()/set_settings()`): `calendars` (list of
-  `{id, name, type, source, account_id, google_calendar, enabled, color}`), `google`
-  (`{client_id, client_secret, accounts: [{id, email}]}` - credentials and account *names* only,
-  never tokens), `refresh_minutes`, `days_ahead`, `time_format`, `hide_all_day`. UI is hand-built in `settings_area.py`; any change goes through
+  `{id, name, type, source, account_provider, account_id, google_calendar, enabled, color}`),
+  `accounts` (list of `{provider, id, label, email}` - names only, never tokens; entries saved
+  before providers existed sit under `google.accounts` and are read as `oauth` ones), `google`
+  (`{client_id, client_secret}` - the OAuth provider's own client), `refresh_minutes`,
+  `days_ahead`, `time_format`, `hide_all_day`. UI is hand-built in `settings_area.py`; any change goes through
   `CalendarInfoPlugin.on_settings_changed()` which refreshes `self.options`, re-pushes the
   backend config, and re-decorates cached events. Actions read `plugin_base.options`, never
   the JSON file, on the tick path.

@@ -25,6 +25,9 @@ from .internal.events import TZ_EVENT, TZ_LOCAL, TZ_UTC, format_clock, local_tz,
 
 TIME_FORMAT_OPTIONS = [("auto", "System default"), ("12", "12-hour"), ("24", "24-hour")]
 DEFAULT_COLOR = (66, 133, 244, 255)
+DEFAULT_ACCOUNT_PROVIDER = "oauth"
+# How each account provider (backend/accounts/registry.py) is named in the UI.
+PROVIDER_LABELS = {"oauth": "Google OAuth client"}
 
 @functools.lru_cache(maxsize=1)
 def available_timezones() -> list[str]:
@@ -288,7 +291,7 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         self.connect_row.add_suffix(self.connect_button)
         self.google_list.append(self.connect_row)
 
-        self._account_rows: dict[str, Adw.ActionRow] = {}
+        self._account_rows: dict[tuple[str, str], Adw.ActionRow] = {}
         self._refresh_google_rows()
 
     def _save_google_credentials(self) -> None:
@@ -310,8 +313,10 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             self.google_list.remove(row)
         self._account_rows.clear()
         # Linked accounts sit between the client row and the connect row.
-        for position, account in enumerate(self.plugin_base.get_google_accounts(), start=1):
-            row = Adw.ActionRow(title=account["email"] or "Google account", subtitle="Linked")
+        for position, account in enumerate(self.plugin_base.get_accounts(), start=1):
+            provider_label = PROVIDER_LABELS.get(account["provider"], account["provider"])
+            row = Adw.ActionRow(title=GLib.markup_escape_text(_account_title(account)),
+                                subtitle=f"Linked · {GLib.markup_escape_text(provider_label)}")
             add_button = Gtk.Button(label="Add calendars", valign=Gtk.Align.CENTER)
             add_button.connect("clicked", lambda _b, a=account: self._pick_google_calendars(a))
             row.add_suffix(add_button)
@@ -320,7 +325,7 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             remove_button.connect("clicked", lambda _b, a=account: self._confirm_disconnect(a))
             row.add_suffix(remove_button)
             self.google_list.insert(row, position)
-            self._account_rows[account["id"]] = row
+            self._account_rows[(account["provider"], account["id"])] = row
 
     # --- consent flow ------------------------------------------------------------------------
 
@@ -377,7 +382,8 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         self._set_connecting(False)
         if result.get("state") == "ok":
             email = result.get("email") or "your account"
-            self.plugin_base.add_google_account(result.get("account_id", ""), result.get("email", ""))
+            self.plugin_base.add_account(DEFAULT_ACCOUNT_PROVIDER, result.get("account_id", ""),
+                                         email=result.get("email", ""))
             self.connect_status.set_label(f"Connected {email}")
             self._refresh_google_rows()
         else:
@@ -394,9 +400,9 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
 
     def _confirm_disconnect(self, account: dict) -> None:
         dialog = Adw.AlertDialog(
-            heading="Disconnect this Google account?",
-            body=(f"{account['email']} will be unlinked, its stored login revoked, and every "
-                  "calendar reading through it removed."),
+            heading="Disconnect this account?",
+            body=(f"{_account_title(account)} will be unlinked, whatever login this plugin stored "
+                  "for it revoked, and every calendar reading through it removed."),
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("disconnect", "Disconnect")
@@ -409,7 +415,7 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             return
         # Revoking talks to Google, so drop the rows now and do the network part on a thread.
         for calendar_id in [cid for cid, row in self._rows.items()
-                            if row.to_dict().get("account_id") == account["id"]]:
+                            if row.account_provider == account["provider"] and row.account_id == account["id"]]:
             row = self._rows.pop(calendar_id, None)
             if row is not None:
                 self.calendar_list.remove(row)
@@ -419,7 +425,7 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
                          name="calendar_google_disconnect", daemon=True).start()
 
     def _disconnect_thread(self, account: dict) -> None:
-        self.plugin_base.remove_google_account(account["id"])
+        self.plugin_base.remove_account(account["provider"], account["id"])
         GLib.idle_add(self._on_disconnected)
 
     def _on_disconnected(self) -> None:
@@ -476,7 +482,7 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
                          name="calendar_google_list", daemon=True).start()
 
     def _list_calendars_thread(self, account: dict) -> None:
-        result = self.plugin_base.google_list_calendars(account["id"])
+        result = self.plugin_base.list_calendars("google", account["provider"], account["id"])
         GLib.idle_add(self._show_calendar_picker, account, result)
 
     def _show_calendar_picker(self, account: dict, result: dict) -> None:
@@ -485,16 +491,17 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             return
         self.connect_status.set_label("")
 
-        already = {(c["account_id"], c["google_calendar"]) for c in self.plugin_base.get_calendars()}
+        already = {(c["account_provider"], c["account_id"], c["google_calendar"])
+                   for c in self.plugin_base.get_calendars()}
         group = Adw.PreferencesGroup(
-            title=f"Calendars on {account['email']}",
+            title=f"Calendars on {GLib.markup_escape_text(_account_title(account))}",
             description="Each one you add becomes a calendar entry with its own color and switch.",
         )
         checks: list[tuple[dict, Gtk.CheckButton]] = []
         for calendar in result.get("calendars", []):
             row = Adw.ActionRow(title=calendar.get("name") or calendar.get("id", ""),
                                 subtitle=calendar.get("id", ""))
-            if (account["id"], calendar.get("id")) in already:
+            if (account["provider"], account["id"], calendar.get("id")) in already:
                 row.set_subtitle("Already added")
                 row.set_sensitive(False)
             else:
@@ -526,6 +533,7 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
                 "name": calendar.get("name") or "Google calendar",
                 "type": "google",
                 "source": "",
+                "account_provider": account["provider"],
                 "account_id": account["id"],
                 "google_calendar": calendar.get("id", ""),
                 "enabled": True,
@@ -593,12 +601,17 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         self.status_label.set_label(text)
 
 
+def _account_title(account: dict) -> str:
+    return account.get("email") or account.get("label") or "Account"
+
+
 class CalendarRow(Adw.ExpanderRow):
     def __init__(self, group: CalendarSettingsGroup, calendar: dict):
         super().__init__(title=calendar["name"] or "Calendar", subtitle="")
         self.group = group
         self.calendar_id = calendar["id"]
         self.calendar_type = calendar.get("type") or "ics"
+        self.account_provider = calendar.get("account_provider") or DEFAULT_ACCOUNT_PROVIDER
         self.account_id = calendar.get("account_id", "")
         self.google_calendar = calendar.get("google_calendar", "")
         self.source_row = None
@@ -616,32 +629,9 @@ class CalendarRow(Adw.ExpanderRow):
         self.name_row.connect("apply", self._on_name_applied)
         self.add_row(self.name_row)
 
-        if self.calendar_type == "google":
-            # A Google calendar is addressed by account + calendar id, both chosen in the
-            # picker, so there is nothing here to type - or to test separately: the account's
-            # own status row already reports what the last fetch did.
-            account = next((a for a in group.plugin_base.get_google_accounts()
-                            if a["id"] == self.account_id), None)
-            self.add_row(Adw.ActionRow(
-                title="Google account",
-                subtitle=account["email"] if account else "Account no longer linked",
-            ))
-            self.add_row(Adw.ActionRow(title="Calendar", subtitle=self.google_calendar or "-"))
-        else:
-            self.source_row = Adw.EntryRow(
-                title="Address (.ics URL, webcal:// or file path) - press Enter to apply",
-                text=calendar.get("source", ""), show_apply_button=True,
-            )
-            self.source_row.connect("apply", lambda *a: self.group._save_calendars())
-            self.add_row(self.source_row)
-
-            self.test_label = Gtk.Label(label="", css_classes=["dim-label"], wrap=True, xalign=1, max_width_chars=40)
-            self.test_button = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
-            self.test_button.connect("clicked", self._on_test_clicked)
-            test_row = Adw.ActionRow(title="Check this calendar", subtitle="Fetches the address once and reports what it found")
-            test_row.add_suffix(self.test_label)
-            test_row.add_suffix(self.test_button)
-            self.add_row(test_row)
+        # One builder per calendar type; a new type adds an entry here.
+        builders = {"google": self._build_google_rows, "ics": self._build_ics_rows}
+        builders.get(self.calendar_type, self._build_ics_rows)(calendar)
 
         remove_button = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER, css_classes=["destructive-action"])
         remove_button.connect("clicked", lambda *a: self.group.remove_calendar(self.calendar_id))
@@ -649,12 +639,41 @@ class CalendarRow(Adw.ExpanderRow):
         remove_row.add_suffix(remove_button)
         self.add_row(remove_row)
 
+    def _build_google_rows(self, calendar: dict) -> None:
+        # A Google calendar is addressed by account + calendar id, both chosen in the
+        # picker, so there is nothing here to type - or to test separately: the account's
+        # own status row already reports what the last fetch did.
+        account = next((a for a in self.group.plugin_base.get_accounts()
+                        if a["provider"] == self.account_provider and a["id"] == self.account_id), None)
+        self.add_row(Adw.ActionRow(
+            title="Google account",
+            subtitle=GLib.markup_escape_text(_account_title(account)) if account else "Account no longer linked",
+        ))
+        self.add_row(Adw.ActionRow(title="Calendar", subtitle=self.google_calendar or "-"))
+
+    def _build_ics_rows(self, calendar: dict) -> None:
+        self.source_row = Adw.EntryRow(
+            title="Address (.ics URL, webcal:// or file path) - press Enter to apply",
+            text=calendar.get("source", ""), show_apply_button=True,
+        )
+        self.source_row.connect("apply", lambda *a: self.group._save_calendars())
+        self.add_row(self.source_row)
+
+        self.test_label = Gtk.Label(label="", css_classes=["dim-label"], wrap=True, xalign=1, max_width_chars=40)
+        self.test_button = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
+        self.test_button.connect("clicked", self._on_test_clicked)
+        test_row = Adw.ActionRow(title="Check this calendar", subtitle="Fetches the address once and reports what it found")
+        test_row.add_suffix(self.test_label)
+        test_row.add_suffix(self.test_button)
+        self.add_row(test_row)
+
     def to_dict(self) -> dict:
         return {
             "id": self.calendar_id,
             "name": self.name_row.get_text().strip() or "Calendar",
             "type": self.calendar_type,
             "source": self.source_row.get_text().strip() if self.source_row is not None else "",
+            "account_provider": self.account_provider,
             "account_id": self.account_id,
             "google_calendar": self.google_calendar,
             "enabled": self.enabled_switch.get_active(),
