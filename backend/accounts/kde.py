@@ -35,9 +35,16 @@ BUS_ADDRESS_ENV = "CALENDAR_INFO_ACCOUNTS_DBUS_ADDRESS"
 DEFAULT_PROVIDERS_DIR = "/usr/share/accounts/providers"
 _DBUS_TIMEOUT_MS = 60_000
 _EXPIRY_SKEW_SECONDS = 60
-# Accounts-SSO providers whose token a calendar source here can use. CalDAV would add
-# nextcloud/owncloud (password method -> basic credential).
-SUPPORTED_PROVIDERS = ("google",)
+# What an Accounts-SSO provider's accounts *are*, which is the one thing discovery cannot read
+# from the desktop: kaccounts-providers ships no calendar service for either google or
+# nextcloud (its nextcloud-contacts.service even carries a "enable once Akonadi supports
+# CalDAV" note, and service_types/ is empty), so the mapping has to live here. Whether
+# anything can read a kind yet is the sources' business, not this table's.
+PROVIDER_KINDS = {
+    "google": "google",
+    "nextcloud": "dav",
+    "owncloud": "dav",
+}
 
 
 class _GiUnavailable(Exception):
@@ -76,6 +83,7 @@ def default_db_path() -> str:
 
 class KdeAccountsProvider(AccountProvider):
     provider_id = "kde"
+    discoverable = True
 
     def __init__(self, db_path: str | None = None, providers_dir: str | None = None,
                  bus_address: str | None = None, use_gi: bool = True):
@@ -96,13 +104,15 @@ class KdeAccountsProvider(AccountProvider):
     # --- discovery ---------------------------------------------------------------------
 
     def list_accounts(self) -> list[AccountInfo]:
+        """Every enabled account on the desktop, classified. An account whose kind nothing can
+        read yet is still returned - the backend marks it, and the UI says so."""
         try:
             rows = self._accounts_via_gi()
         except _GiUnavailable:
             rows = self._accounts_via_db()
-        return [AccountInfo(self.provider_id, str(account_id), label=name)
-                for account_id, name, ag_provider, enabled in rows
-                if enabled and ag_provider in SUPPORTED_PROVIDERS]
+        return [AccountInfo(self.provider_id, str(account_id), label=name,
+                            kind=PROVIDER_KINDS.get(ag_provider, ""))
+                for account_id, name, ag_provider, enabled in rows if enabled]
 
     def _accounts_via_gi(self) -> list[tuple[int, str, str, bool]]:
         Accounts = _gi_accounts(self.use_gi)

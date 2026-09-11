@@ -19,6 +19,7 @@ _EXPIRY_SKEW_SECONDS = 60
 
 class OAuthGoogleProvider(AccountProvider):
     provider_id = "oauth"
+    calendar_types = ("google",)
 
     def __init__(self, client_id: str = "", client_secret: str = "", credentials_dir: str = ""):
         self.client_id = client_id

@@ -108,10 +108,24 @@ class FallbackTests(unittest.TestCase):
         self.assertFalse(KdeAccountsProvider(db_path=os.path.join(self._dir.name, "nope.db"), use_gi=False).available())
         self.assertIn(SIGNOND_NAME, self.provider.required_permissions()["dbus"])
 
-    def test_lists_enabled_supported_accounts_only(self):
+    def test_lists_every_enabled_account_classified(self):
         accounts = self.provider.list_accounts()
-        self.assertEqual([(a.provider, a.id, a.label) for a in accounts],
-                         [("kde", "1", "google1"), ("kde", "4", "template-only")])
+        # Account 3 is disabled, so it is absent; account 2 is Nextcloud, so it is present but
+        # classified `dav` for the backend to mark as unsupported.
+        self.assertEqual([(a.id, a.label, a.kind) for a in accounts],
+                         [("1", "google1", "google"), ("2", "cloud", "dav"), ("4", "template-only", "google")])
+        self.assertTrue(all(a.provider == "kde" for a in accounts))
+
+    def test_an_unknown_provider_is_kept_with_no_kind(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO Accounts (id, name, provider, enabled) VALUES (5, 'odd', 'weirdcloud', 1)")
+        conn.commit()
+        conn.close()
+        odd = next(a for a in self.provider.list_accounts() if a.id == "5")
+        self.assertEqual(odd.kind, "")
+
+    def test_discoverable(self):
+        self.assertTrue(self.provider.discoverable)
 
     def test_auth_data_from_account_settings(self):
         credentials_id, method, mechanism, params = self.provider._auth_data("1")

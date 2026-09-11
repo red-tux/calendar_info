@@ -342,9 +342,13 @@ class CalendarInfoPlugin(PluginBase):
         self.on_settings_changed()
 
     def get_accounts(self) -> list[dict]:
-        """Linked accounts as [{"provider", "id", "label", "email"}]. Accounts saved before
-        providers existed sit under google.accounts and are OAuth ones; they are read here and
-        rewritten in the new place on the next change."""
+        """Linked accounts as [{"provider", "id", "label", "email", "calendar_type"}].
+
+        `calendar_type` is which source reads this account's calendars, so the UI knows what
+        an account is good for without re-running discovery. Accounts saved before providers
+        existed sit under google.accounts, and accounts saved before this field existed can
+        only be Google ones - both are read here and rewritten in the new shape on the next
+        change."""
         settings = self.get_settings()
         raw_accounts = list(settings.get("accounts") or [])
         legacy = (settings.get("google") or {}).get("accounts") or []
@@ -358,7 +362,8 @@ class CalendarInfoPlugin(PluginBase):
                 continue
             seen.add(key)
             accounts.append({"provider": key[0], "id": key[1],
-                             "label": str(raw.get("label") or ""), "email": str(raw.get("email") or "")})
+                             "label": str(raw.get("label") or ""), "email": str(raw.get("email") or ""),
+                             "calendar_type": str(raw.get("calendar_type") or CALENDAR_TYPE_GOOGLE)})
         return accounts
 
     def _write_accounts(self, settings: dict, accounts: list[dict]) -> None:
@@ -367,12 +372,14 @@ class CalendarInfoPlugin(PluginBase):
         google.pop("accounts", None)
         settings["google"] = google
 
-    def add_account(self, provider: str, account_id: str, label: str = "", email: str = "") -> None:
+    def add_account(self, provider: str, account_id: str, label: str = "", email: str = "",
+                    calendar_type: str = CALENDAR_TYPE_GOOGLE) -> None:
         # Re-linking the same OAuth account gets a fresh id but the same address; desktop
         # providers' ids are stable. Either way the old entry goes.
         accounts = [a for a in self.get_accounts()
                     if a["provider"] != provider or (a["id"] != account_id and not (email and a["email"] == email))]
-        accounts.append({"provider": provider, "id": account_id, "label": label, "email": email})
+        accounts.append({"provider": provider, "id": account_id, "label": label, "email": email,
+                         "calendar_type": calendar_type})
         settings = self.get_settings()
         self._write_accounts(settings, accounts)
         self.set_settings(settings)
@@ -396,9 +403,20 @@ class CalendarInfoPlugin(PluginBase):
         self.set_settings(settings)
         self.on_settings_changed()
 
+    def describe_sources(self) -> list[dict]:
+        """The calendar types and how each is added, for the settings UI's add-a-source
+        choices. Blocking; call from a worker thread."""
+        if self.backend is None:
+            return []
+        try:
+            return json.loads(self.backend.describe_sources()).get("sources") or []
+        except Exception as e:
+            log.warning(f"Could not read the calendar source descriptions: {e}")
+            return []
+
     def list_desktop_accounts(self) -> dict:
-        """Accounts the desktop providers can offer to link. Blocking; call from a worker
-        thread. {"ok", "accounts", "error"}."""
+        """Accounts the desktop providers can offer to link, each classified (`supported`,
+        `detail`). Blocking; call from a worker thread. {"ok", "accounts", "error"}."""
         if self.backend is None:
             return {"ok": False, "accounts": [], "error": "Calendar backend is still starting"}
         try:

@@ -6,8 +6,17 @@ from unittest import mock
 
 from backend import sources
 from backend.accounts.base import AccountProvider
+from backend.accounts.registry import make_providers
 from backend.source_errors import AuthError, SourceError
-from backend.sources import SOURCES, GoogleSource, IcsSource, SourceContext, source_for
+from backend.sources import (
+    SOURCES,
+    GoogleSource,
+    IcsSource,
+    SourceContext,
+    classify_account_kind,
+    describe_sources,
+    source_for,
+)
 
 
 def _ics_with_event(start: datetime) -> str:
@@ -44,6 +53,39 @@ class RegistryTests(unittest.TestCase):
     def test_ics_has_nothing_to_list(self):
         with self.assertRaises(SourceError):
             IcsSource().list_calendars(AccountProvider(), "acc")
+
+    def test_only_account_backed_sources_need_an_account(self):
+        self.assertTrue(GoogleSource().needs_account)
+        self.assertFalse(IcsSource().needs_account)
+        self.assertEqual([f["key"] for f in IcsSource().manual_fields], ["source"])
+        self.assertEqual(GoogleSource().manual_fields, ())
+
+
+class ClassificationTests(unittest.TestCase):
+    def test_a_kind_a_source_declares_is_supported(self):
+        self.assertEqual(classify_account_kind("google"), ("google", True, ""))
+
+    def test_a_kind_no_source_declares_is_named_but_unsupported(self):
+        calendar_type, supported, detail = classify_account_kind("dav")
+        self.assertEqual((calendar_type, supported), ("", False))
+        self.assertIn("CalDAV", detail)
+        self.assertIn("not built yet", detail)
+
+    def test_an_unknown_kind_says_so(self):
+        calendar_type, supported, detail = classify_account_kind("")
+        self.assertEqual((calendar_type, supported), ("", False))
+        self.assertIn("does not recognise", detail)
+
+    def test_describe_sources_names_manual_providers_only(self):
+        entries = {entry["id"]: entry for entry in describe_sources(make_providers())}
+        self.assertEqual(entries["google"]["providers"], ["oauth"])   # kde is discoverable
+        self.assertTrue(entries["google"]["needs_account"])
+        self.assertEqual(entries["google"]["account_kinds"], ["google"])
+        self.assertEqual(entries["ics"]["providers"], [])
+        self.assertFalse(entries["ics"]["needs_account"])
+        self.assertEqual(entries["ics"]["manual_fields"][0]["key"], "source")
+        for entry in entries.values():
+            self.assertTrue(entry["label"])
 
 
 class IcsCacheTests(unittest.TestCase):

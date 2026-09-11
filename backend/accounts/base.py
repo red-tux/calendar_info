@@ -18,20 +18,37 @@ class Credential:
 
 @dataclass
 class AccountInfo:
-    """An account a provider can offer to link. Never carries a secret."""
+    """An account a provider can offer to link. Never carries a secret.
+
+    The provider fills in `kind` - what the account *is* ("google", "dav", ...) - and the
+    backend resolves the rest against the registered sources, so an account type nothing can
+    read yet is still offered and explained rather than silently dropped.
+    """
     provider: str
     id: str
     label: str = ""
     email: str = ""
+    kind: str = ""
+    calendar_type: str = ""
+    supported: bool = False
+    detail: str = ""
 
     def to_dict(self) -> dict:
-        return {"provider": self.provider, "id": self.id, "label": self.label, "email": self.email}
+        return {"provider": self.provider, "id": self.id, "label": self.label, "email": self.email,
+                "kind": self.kind, "calendar_type": self.calendar_type,
+                "supported": self.supported, "detail": self.detail}
 
 
 class AccountProvider:
     """Interface every provider implements; the backend keeps one instance per provider."""
 
     provider_id = ""
+    # True when accounts come from somewhere outside this plugin (the desktop) and are found by
+    # `list_accounts()`; False when linking *is* a flow of our own, as OAuth consent is.
+    discoverable = False
+    # Which calendar types a non-discoverable provider can authenticate, for the manual add
+    # choices. Discoverable providers say nothing here - what they serve is per account.
+    calendar_types: tuple[str, ...] = ()
 
     def configure(self, config: dict) -> None:
         """Called with the full backend configuration whenever it is (re)pushed."""

@@ -33,7 +33,7 @@ from backend.accounts.registry import DEFAULT_PROVIDER, make_providers  # noqa: 
 from backend.google_oauth import AuthFlowError, LoopbackFlow, PendingFlow  # noqa: E402
 from backend.google_source import GoogleClient  # noqa: E402
 from backend.source_errors import AuthError, SourceError  # noqa: E402
-from backend.sources import SourceContext, source_for  # noqa: E402
+from backend.sources import SourceContext, classify_account_kind, describe_sources, source_for  # noqa: E402
 from internal.events import CalendarEvent, CalendarStatus  # noqa: E402
 
 DEFAULT_REFRESH_SECONDS = 300
@@ -94,9 +94,16 @@ class CalendarBackend(BackendBase):
         sample = [e.title for e in events[:3]]
         return json.dumps({"ok": True, "count": len(events), "error": None, "sample": sample})
 
+    def describe_sources(self) -> str:
+        """What calendar types exist and how each one is added. JSON
+        {"sources": [{"id", "label", "needs_account", "manual_fields", "account_kinds",
+        "providers"}]}."""
+        return json.dumps({"sources": describe_sources(self._providers)})
+
     def list_accounts(self, provider: str = "") -> str:
-        """Accounts the providers can offer to link (all of them, or one). JSON
-        {"ok", "accounts": [{"provider", "id", "label", "email"}], "error"}."""
+        """Accounts the providers can offer to link (all of them, or one), each classified
+        against the registered sources. JSON {"ok", "accounts": [{"provider", "id", "label",
+        "email", "kind", "calendar_type", "supported", "detail"}], "error"}."""
         names = [provider] if provider else list(self._providers)
         accounts: list[dict] = []
         errors: list[str] = []
@@ -107,7 +114,10 @@ class CalendarBackend(BackendBase):
                 continue
             try:
                 if candidate.available():
-                    accounts.extend(a.to_dict() for a in candidate.list_accounts())
+                    for account in candidate.list_accounts():
+                        account.calendar_type, account.supported, account.detail = \
+                            classify_account_kind(account.kind)
+                        accounts.append(account.to_dict())
             except SourceError as e:
                 errors.append(f"{name}: {e}")
             except Exception as e:

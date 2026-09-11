@@ -11,13 +11,25 @@ which trades a longer one-time setup for events that appear as soon as they are 
 
 ## Setup
 
-1. **Get your calendar's iCalendar address.** Google Calendar: *Settings → (your calendar) →
-   Integrate calendar → Secret address in iCal format*. Treat it like a password; anyone with
-   the address can read the calendar.
-2. In **StreamController**: *Plugins → Calendar Info → settings (gear)*.
-3. Click **+** under *Calendars*, give it a name, paste the address into *Address* and press
-   Enter, pick a color. **Test** fetches it once and tells you how many events it found.
-4. Add more calendars the same way. Each gets its own color bar on the keys.
+In **StreamController**, open *Plugins → Calendar Info → settings (gear)* and press **+** under
+*Calendar sources*. What you get offered depends on what is available:
+
+- **From this desktop** - any account already set up in your desktop's online accounts (KDE
+  Plasma today). Pick one and Calendar Info works out what it is and lists its calendars. No
+  addresses to copy, no OAuth client to register, and the desktop keeps the login.
+- **iCalendar address or file** - the universal option. Paste a `.ics` URL, a `webcal://`
+  address or a path to a local file. Google Calendar's is under *Settings → (your calendar) →
+  Integrate calendar → Secret address in iCal format*; treat it like a password, since anyone
+  with the address can read the calendar. **Test** fetches it once and reports what it found.
+- **Google Calendar (Google OAuth client)** - the API route, for fresher events than the secret
+  address can give. It needs a one-time Cloud console setup; see below.
+
+An account appears in the list as an expander holding the calendars read through it; an
+iCalendar feed appears on its own. Each calendar has its own name, color bar and on/off switch.
+**Add calendars** on an account row picks up calendars added later.
+
+Options on the same screen: refresh interval (default 5 minutes), how many days to look ahead
+(default 7), 12/24-hour time, **Display Timezone**, and hiding all-day events everywhere.
 
 Options on the same screen: refresh interval (default 5 minutes), how many days to look ahead
 (default 7), 12/24-hour time, **Display Timezone**, and hiding all-day events everywhere.
@@ -62,10 +74,10 @@ you can revoke it at any time. Google has no API for any of these steps, so the 
 4. **Publish the app** - [Audience](https://console.cloud.google.com/auth/audience) → *Publish app*. If you leave it in *Testing*, Google expires the login after 7 days and your calendars go stale with an `invalid_grant` error. Google will call the app unverified: that only matters for apps handed to other people, so choose *Advanced* → the *Go to …* link to continue.
 5. **Create the OAuth client** - [Clients](https://console.cloud.google.com/auth/clients) → *Create client* → application type **Desktop app**. There is no redirect URI to fill in: the plugin listens on `127.0.0.1` and Google replies there directly.
 
-Then in *Plugins → Calendar Info → settings*, under **Google Calendar**: paste the **Client ID**
-and **Client secret**, press **Connect**, and approve in the browser tab that opens. Once the
-account is linked, **Add calendars** lists the calendars on it and each one you tick becomes a
-normal calendar entry - same color swatch, same on/off switch, same actions.
+Then press **+** under *Calendar sources*, choose **Google Calendar (Google OAuth client)**,
+paste the **Client ID** and **Client secret**, press **Connect**, and approve in the browser tab
+that opens. The calendar picker opens straight afterwards: each one you tick becomes a normal
+calendar entry under the account - same color swatch, same on/off switch, same actions.
 
 The only scope requested is `calendar.readonly`, so the plugin cannot change your calendar.
 The refresh token is stored in `credentials/` inside the plugin folder, mode 0600, and never in
@@ -75,11 +87,14 @@ calendar that was reading through it.
 ### Or: use the Google account from your desktop (KDE)
 
 If you run KDE Plasma and your Google account is already in *System Settings → Online
-Accounts*, skip the whole OAuth client setup: under **Google Calendar** press **Link…** next to
-*Link a desktop account* and pick it. The desktop's own login is used, the plugin stores no
-token at all (it asks the desktop for a short-lived one when it needs it), and **Add calendars**
-works exactly as above. Disconnecting here only unlinks it from the plugin; the desktop account
-itself is untouched.
+Accounts*, skip the whole OAuth client setup: press **+** under *Calendar sources* and pick it
+under *From this desktop*. The desktop's own login is used and the plugin stores no token at all
+(it asks the desktop for a short-lived one when it needs it). Disconnecting only unlinks it from
+the plugin; the desktop account itself is untouched.
+
+Accounts of a kind Calendar Info cannot read yet - a Nextcloud account, say - are listed there
+too, greyed out and labelled with what is missing, so you can see what a future version will
+pick up.
 
 Two notes for the Flatpak build of StreamController: the sandbox hides the desktop's account
 list and its login service, so the first time you link, the plugin asks for the D-Bus permission

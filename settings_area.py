@@ -1,11 +1,15 @@
-"""Plugin-level settings screen: the calendar list plus refresh/display options.
+"""Plugin-level settings screen: display options plus the calendar sources.
 
 Built manually because plugin-level settings have no GenerativeUI widget set (that's only for
 per-action settings stored in page JSON). Returned from PluginBase.get_settings_area(), which
 the app drops into an Adw.PreferencesPage - so this has to be a single Adw.PreferencesGroup.
 
-Layout, top to bottom: option rows, then a "Calendars" list where each calendar is an
-expander row holding its name, address, color, test and remove controls.
+Layout, top to bottom: option rows, then one "Calendar sources" list. A source is either an
+account (an expander holding the calendars read through it) or a standalone calendar (an
+iCalendar feed, which has no account behind it). The single + button opens a dialog whose
+choices are built from what the backend reports - the accounts your desktop already has, and
+the calendar types that can be added by hand - so a new source or provider shows up here
+without this file learning its name.
 """
 import functools
 import subprocess
@@ -28,8 +32,7 @@ DEFAULT_COLOR = (66, 133, 244, 255)
 DEFAULT_ACCOUNT_PROVIDER = "oauth"
 # How each account provider (backend/accounts/registry.py) is named in the UI.
 PROVIDER_LABELS = {"oauth": "Google OAuth client", "kde": "KDE Online Accounts"}
-# Providers whose accounts come from the desktop rather than a consent flow here.
-DESKTOP_PROVIDERS = ("kde",)
+
 
 @functools.lru_cache(maxsize=1)
 def available_timezones() -> list[str]:
@@ -102,18 +105,32 @@ def _tuple_from_rgba(rgba: Gdk.RGBA) -> list[int]:
     return [round(rgba.red * 255), round(rgba.green * 255), round(rgba.blue * 255), round(rgba.alpha * 255)]
 
 
+def _escape(text: str) -> str:
+    """Every hand-built Adw row title is parsed as Pango markup, so a calendar called
+    'Personal & Family' would silently blank the row."""
+    return GLib.markup_escape_text(str(text or ""))
+
+
+def _account_title(account: dict) -> str:
+    return account.get("email") or account.get("label") or "Account"
+
+
+def _provider_label(provider: str) -> str:
+    return PROVIDER_LABELS.get(provider, provider)
+
+
 class CalendarSettingsGroup(Adw.PreferencesGroup):
     def __init__(self, plugin_base):
         super().__init__(
             title="Calendar Info",
-            description=(
-                "Any iCalendar (.ics) address or file works. Google Calendar: Settings → the "
-                "calendar → 'Integrate calendar' → copy the 'Secret address in iCal format'."
-            ),
+            description="Add the accounts and calendar feeds your keys read from.",
         )
         self.plugin_base = plugin_base
-        self._rows: dict[str, CalendarRow] = {}
+        self._calendar_rows: dict[str, CalendarRow] = {}
+        self._account_rows: dict[tuple[str, str], AccountRow] = {}
         self._store_token = None
+        self._auth_flow_id = None
+        self._add_dialog = None
 
         settings = plugin_base.get_settings()
 
@@ -179,29 +196,24 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         status_row.add_suffix(self.refresh_button)
         self.add(status_row)
 
-        # --- google account --------------------------------------------------------------
-        self._auth_flow_id = None
-        self._build_google_section()
-
-        # --- calendars -------------------------------------------------------------------
+        # --- calendar sources --------------------------------------------------------------
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, margin_top=18, margin_bottom=6)
-        header.append(Gtk.Label(label="Calendars", xalign=0, hexpand=True, css_classes=["heading"]))
-        add_button = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add calendar", css_classes=["flat"])
-        add_button.connect("clicked", self._on_add_clicked)
-        header.append(add_button)
+        header.append(Gtk.Label(label="Calendar sources", xalign=0, hexpand=True, css_classes=["heading"]))
+        self.add_button = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add a calendar source",
+                                     css_classes=["flat"])
+        self.add_button.connect("clicked", self._on_add_clicked)
+        header.append(self.add_button)
         self.add(header)
 
-        self.calendar_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
-        self.add(self.calendar_list)
+        self.sources_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        self.add(self.sources_list)
 
         self.empty_row = Adw.ActionRow(
-            title="No calendars yet",
-            subtitle="Click + for an iCalendar address or file, or connect a Google account above",
+            title="No calendar sources yet",
+            subtitle="Press + to link an account from your desktop or add an iCalendar address",
         )
-        for calendar in plugin_base.get_calendars():
-            self._add_row(calendar)
-        self._update_empty_row()
 
+        self._refresh_sources()
         self.update_status()
         self.connect("realize", self._on_realize)
         self.connect("unrealize", self._on_unrealize)
@@ -226,7 +238,9 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         self.plugin_base.on_settings_changed()
 
     def _save_calendars(self) -> None:
-        self.plugin_base.set_calendars([row.to_dict() for row in self._rows.values()])
+        """Persist what the rows currently hold. Does not rebuild the list - the row being
+        edited would be destroyed under the cursor."""
+        self.plugin_base.set_calendars([row.to_dict() for row in self._calendar_rows.values()])
         self.update_status()
 
     def _on_time_format_changed(self, row, _param) -> None:
@@ -242,103 +256,232 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         self.plugin_base.refresh_now()
         self.status_label.set_label("Refreshing…")
 
-    # --- google account ----------------------------------------------------------------------
-    #
-    # No OAuth client ships with the plugin: the user registers one in their own Google Cloud
-    # project, exactly as Home Assistant's application_credentials does. That is what keeps
-    # every install clear of Google's verification process and shared quota.
+    # --- the sources list --------------------------------------------------------------------
 
-    def _build_google_section(self) -> None:
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, margin_top=18, margin_bottom=6)
-        header.append(Gtk.Label(label="Google Calendar", xalign=0, hexpand=True, css_classes=["heading"]))
-        guide_button = Gtk.Button(label="Setup guide", css_classes=["flat"], valign=Gtk.Align.CENTER)
-        guide_button.connect("clicked", lambda *a: self._show_setup_guide())
-        header.append(guide_button)
-        self.add(header)
+    def _refresh_sources(self) -> None:
+        """Rebuild the list from the saved configuration: one row per account (holding the
+        calendars read through it), then one per calendar that has no account."""
+        for row in list(self._account_rows.values()):
+            self.sources_list.remove(row)
+        for row in list(self._calendar_rows.values()):
+            if row.get_parent() is self.sources_list:
+                self.sources_list.remove(row)
+        if self.empty_row.get_parent() is not None:
+            self.sources_list.remove(self.empty_row)
+        self._account_rows.clear()
+        self._calendar_rows.clear()
 
-        self.google_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
-        self.add(self.google_list)
+        calendars = self.plugin_base.get_calendars()
+        for account in self.plugin_base.get_accounts():
+            key = (account["provider"], account["id"])
+            mine = [c for c in calendars
+                    if c["account_provider"] == account["provider"] and c["account_id"] == account["id"]]
+            row = AccountRow(self, account, mine)
+            self.sources_list.append(row)
+            self._account_rows[key] = row
 
+        for calendar in calendars:
+            if not calendar["account_id"]:
+                row = CalendarRow(self, calendar)
+                self.sources_list.append(row)
+                self._calendar_rows[calendar["id"]] = row
+
+        if not self._account_rows and not self._calendar_rows:
+            self.sources_list.append(self.empty_row)
+        self.update_status()
+
+    def register_calendar_row(self, row: "CalendarRow") -> None:
+        """Account rows build their own calendar rows; they still have to be saved and status
+        -updated with everything else."""
+        self._calendar_rows[row.calendar_id] = row
+
+    def remove_calendar(self, calendar_id: str) -> None:
+        row = self._calendar_rows.pop(calendar_id, None)
+        if row is not None:
+            parent = row.get_parent()
+            if parent is self.sources_list:
+                self.sources_list.remove(row)
+        self._save_calendars()
+        self._refresh_sources()
+
+    def add_calendars(self, calendars: list[dict]) -> None:
+        """Append new calendar entries and persist, without disturbing existing rows' edits."""
+        if not calendars:
+            return
+        existing = [row.to_dict() for row in self._calendar_rows.values()]
+        self.plugin_base.set_calendars(existing + calendars)
+        self._refresh_sources()
+        self.plugin_base.refresh_now()
+
+    # --- add a source --------------------------------------------------------------------------
+
+    def _on_add_clicked(self, button) -> None:
+        """Open the add dialog straight away and fill it in when the backend answers - both
+        the source descriptions and desktop discovery are round trips."""
+        self._add_view = Adw.NavigationView()
+        dialog = Adw.Dialog(title="Add a calendar source", content_width=560, content_height=560)
+        dialog.set_child(self._add_view)
+        self._add_dialog = dialog
+
+        self._add_page_box = Adw.PreferencesPage()
+        loading = Adw.PreferencesGroup()
+        loading.add(Adw.ActionRow(title="Looking for accounts on this desktop…"))
+        self._add_page_box.add(loading)
+        self._add_view.push(Adw.NavigationPage(child=_with_header(self._add_page_box),
+                                               title="Add a calendar source"))
+        dialog.present(self)
+        threading.Thread(target=self._load_add_options, name="calendar_add_options", daemon=True).start()
+
+    def _load_add_options(self) -> None:
+        sources = self.plugin_base.describe_sources()
+        discovered = self.plugin_base.list_desktop_accounts()
+        GLib.idle_add(self._populate_add_dialog, sources, discovered)
+
+    def _populate_add_dialog(self, sources: list[dict], discovered: dict) -> None:
+        if self._add_dialog is None:
+            return
+        page = Adw.PreferencesPage()
+        linked = {(a["provider"], a["id"]) for a in self.plugin_base.get_accounts()}
+        accounts = [a for a in (discovered.get("accounts") or []) if (a["provider"], a["id"]) not in linked]
+
+        desktop = Adw.PreferencesGroup(
+            title="From this desktop",
+            description="Accounts already set up in your desktop's online accounts. The desktop "
+                        "keeps the login; this plugin never stores one.",
+        )
+        if accounts:
+            for account in accounts:
+                row = Adw.ActionRow(title=_escape(_account_title(account)),
+                                    subtitle=_escape(_provider_label(account["provider"])))
+                if account.get("supported"):
+                    button = Gtk.Button(label="Link", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+                    button.connect("clicked", lambda _b, a=account: self._link_desktop_account(a))
+                    row.add_suffix(button)
+                else:
+                    # Discovery found it and knows what it is; nothing can read it yet.
+                    row.set_subtitle(_escape(account.get("detail") or "Not supported yet"))
+                    row.set_sensitive(False)
+                desktop.add(row)
+        else:
+            message = discovered.get("error") or (
+                "No accounts found. Add one in System Settings → Online Accounts, or use a "
+                "manual option below.")
+            desktop.add(Adw.ActionRow(title="Nothing to link", subtitle=_escape(message), subtitle_lines=3))
+        page.add(desktop)
+
+        manual = Adw.PreferencesGroup(title="Add manually")
+        has_desktop_google = any(a.get("calendar_type") == "google" for a in accounts)
+        for source in sources:
+            if source["needs_account"]:
+                for provider in source["providers"]:
+                    row = Adw.ActionRow(
+                        title=_escape(f"{source['label']} ({_provider_label(provider)})"),
+                        subtitle="Register your own OAuth client in the Google Cloud console"
+                                 + (" - your desktop already has a Google account, linking that "
+                                    "above is simpler" if has_desktop_google else ""),
+                        subtitle_lines=3, activatable=True,
+                    )
+                    row.connect("activated", lambda _r: self._push_oauth_page())
+                    manual.add(row)
+            else:
+                row = Adw.ActionRow(title=_escape(source["label"]),
+                                    subtitle="A public or secret address, or a file on this machine",
+                                    activatable=True)
+                row.connect("activated", lambda _r, s=source: self._push_manual_page(s))
+                manual.add(row)
+        page.add(manual)
+
+        self._add_view.pop()
+        self._add_view.push(Adw.NavigationPage(child=_with_header(page), title="Add a calendar source"))
+
+    def _close_add_dialog(self) -> None:
+        if self._add_dialog is not None:
+            self._add_dialog.close()
+            self._add_dialog = None
+
+    # --- add: a calendar typed in by hand ------------------------------------------------------
+
+    def _push_manual_page(self, source: dict) -> None:
+        """One entry row per field the source says it needs, so a new manual type needs no
+        code here."""
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title=_escape(source["label"]))
+        name_row = Adw.EntryRow(title="Name", text="New calendar")
+        group.add(name_row)
+        field_rows = {}
+        for field in source["manual_fields"]:
+            row = Adw.EntryRow(title=_escape(field.get("label") or field["key"]))
+            if field.get("placeholder"):
+                row.set_tooltip_text(field["placeholder"])
+            group.add(row)
+            field_rows[field["key"]] = row
+        page.add(group)
+
+        add_button = Gtk.Button(label="Add", css_classes=["suggested-action"])
+        add_button.connect("clicked", lambda _b: self._on_manual_add(source, name_row, field_rows))
+        self._add_view.push(Adw.NavigationPage(child=_with_header(page, add_button),
+                                               title=source["label"]))
+
+    def _on_manual_add(self, source: dict, name_row, field_rows: dict) -> None:
+        calendar = {
+            "id": uuid.uuid4().hex,
+            "name": name_row.get_text().strip() or "Calendar",
+            "type": source["id"],
+            "source": "",
+            "account_provider": "",
+            "account_id": "",
+            "google_calendar": "",
+            "enabled": True,
+            "color": list(DEFAULT_COLOR),
+        }
+        for key, row in field_rows.items():
+            calendar[key] = row.get_text().strip()
+        self._close_add_dialog()
+        self.add_calendars([calendar])
+
+    # --- add: Google through your own OAuth client ---------------------------------------------
+
+    def _push_oauth_page(self) -> None:
         credentials = self.plugin_base.get_google_credentials()
-        self.client_row = Adw.ExpanderRow(title="OAuth client", subtitle="")
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(
+            title="Your own OAuth client",
+            description="Calendar Info ships no Google credentials, so nothing here is shared "
+                        "with other users and no app verification is involved.",
+        )
         self.client_id_row = Adw.EntryRow(title="Client ID", text=credentials["client_id"],
                                           show_apply_button=True)
         self.client_id_row.connect("apply", lambda *a: self._save_google_credentials())
-        self.client_row.add_row(self.client_id_row)
+        group.add(self.client_id_row)
         self.client_secret_row = Adw.PasswordEntryRow(title="Client secret",
                                                       text=credentials["client_secret"])
         self.client_secret_row.connect("apply", lambda *a: self._save_google_credentials())
-        self.client_row.add_row(self.client_secret_row)
+        group.add(self.client_secret_row)
 
         guide_row = Adw.ActionRow(
             title="Where do these come from?",
             subtitle="Google has no API to create them - the guide opens each console page in order.",
+            subtitle_lines=2,
         )
-        guide_row_button = Gtk.Button(label="Open guide", valign=Gtk.Align.CENTER)
-        guide_row_button.connect("clicked", lambda *a: self._show_setup_guide())
-        guide_row.add_suffix(guide_row_button)
-        self.client_row.add_row(guide_row)
-        self.google_list.append(self.client_row)
+        guide_button = Gtk.Button(label="Open guide", valign=Gtk.Align.CENTER)
+        guide_button.connect("clicked", lambda *a: self._show_setup_guide())
+        guide_row.add_suffix(guide_button)
+        group.add(guide_row)
+        page.add(group)
 
-        self.connect_status = Gtk.Label(label="", css_classes=["dim-label"], wrap=True,
-                                        xalign=1, max_width_chars=40)
-        self.connect_button = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER,
-                                         css_classes=["suggested-action"])
+        self.connect_status = Gtk.Label(label="", css_classes=["dim-label"], wrap=True, xalign=0)
+        status_group = Adw.PreferencesGroup()
+        status_group.add(self.connect_status)
+        page.add(status_group)
+
+        self.connect_button = Gtk.Button(label="Connect", css_classes=["suggested-action"])
         self.connect_button.connect("clicked", self._on_connect_clicked)
-        self.connect_row = Adw.ActionRow(
-            title="Connect a Google account",
-            subtitle="Opens Google in your browser; the reply comes back to 127.0.0.1.",
-        )
-        self.connect_row.add_suffix(self.connect_status)
-        self.connect_row.add_suffix(self.connect_button)
-        self.google_list.append(self.connect_row)
-
-        self.desktop_button = Gtk.Button(label="Link…", valign=Gtk.Align.CENTER)
-        self.desktop_button.connect("clicked", self._on_link_desktop_clicked)
-        self.desktop_row = Adw.ActionRow(
-            title="Link a desktop account",
-            subtitle="A Google account from your desktop's Online Accounts (KDE). No OAuth client needed.",
-        )
-        self.desktop_row.add_suffix(self.desktop_button)
-        self.google_list.append(self.desktop_row)
-
-        self._account_rows: dict[tuple[str, str], Adw.ActionRow] = {}
-        self._refresh_google_rows()
+        self._add_view.push(Adw.NavigationPage(child=_with_header(page, self.connect_button),
+                                               title="Google Calendar"))
 
     def _save_google_credentials(self) -> None:
         self.plugin_base.set_google_credentials(self.client_id_row.get_text(),
                                                 self.client_secret_row.get_text())
-        self._refresh_google_rows()
-
-    def _refresh_google_rows(self) -> None:
-        credentials = self.plugin_base.get_google_credentials()
-        if credentials["client_id"]:
-            client_id = credentials["client_id"]
-            shown = client_id if len(client_id) <= 24 else client_id[:12] + "…" + client_id[-8:]
-            self.client_row.set_subtitle(shown)
-        else:
-            self.client_row.set_subtitle("Not configured yet")
-        self.connect_button.set_sensitive(bool(credentials["client_id"]) and self._auth_flow_id is None)
-
-        for row in self._account_rows.values():
-            self.google_list.remove(row)
-        self._account_rows.clear()
-        # Linked accounts sit between the client row and the connect row.
-        for position, account in enumerate(self.plugin_base.get_accounts(), start=1):
-            provider_label = PROVIDER_LABELS.get(account["provider"], account["provider"])
-            row = Adw.ActionRow(title=GLib.markup_escape_text(_account_title(account)),
-                                subtitle=f"Linked · {GLib.markup_escape_text(provider_label)}")
-            add_button = Gtk.Button(label="Add calendars", valign=Gtk.Align.CENTER)
-            add_button.connect("clicked", lambda _b, a=account: self._pick_google_calendars(a))
-            row.add_suffix(add_button)
-            remove_button = Gtk.Button(label="Disconnect", valign=Gtk.Align.CENTER,
-                                       css_classes=["destructive-action"])
-            remove_button.connect("clicked", lambda _b, a=account: self._confirm_disconnect(a))
-            row.add_suffix(remove_button)
-            self.google_list.insert(row, position)
-            self._account_rows[(account["provider"], account["id"])] = row
-
-    # --- consent flow ------------------------------------------------------------------------
 
     def _on_connect_clicked(self, button) -> None:
         if self._auth_flow_id is not None:
@@ -391,15 +534,17 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             return
         self._auth_flow_id = None
         self._set_connecting(False)
-        if result.get("state") == "ok":
-            email = result.get("email") or "your account"
-            self.plugin_base.add_account(DEFAULT_ACCOUNT_PROVIDER, result.get("account_id", ""),
-                                         email=result.get("email", ""))
-            self.connect_status.set_label(f"Connected {email}")
-            self._refresh_google_rows()
-        else:
+        if result.get("state") != "ok":
             self.connect_status.set_label(result.get("error") or "Authorization failed")
-            self._refresh_google_rows()
+            return
+        account = {"provider": DEFAULT_ACCOUNT_PROVIDER, "id": result.get("account_id", ""),
+                   "label": "", "email": result.get("email", ""), "calendar_type": "google"}
+        self.plugin_base.add_account(account["provider"], account["id"], email=account["email"],
+                                     calendar_type="google")
+        self._close_add_dialog()
+        self._refresh_sources()
+        # Linking is only half the job - go straight to picking the calendars.
+        self._pick_calendars(account)
 
     def _set_connecting(self, connecting: bool) -> None:
         self.connect_button.set_label("Cancel" if connecting else "Connect")
@@ -408,6 +553,132 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             self.connect_button.remove_css_class("suggested-action")
         else:
             self.connect_button.add_css_class("suggested-action")
+
+    # --- add: an account the desktop already has ------------------------------------------------
+
+    def _link_desktop_account(self, account: dict) -> None:
+        self.plugin_base.ensure_provider_permissions(account["provider"])
+        self._close_add_dialog()
+        self.status_label.set_label(f"Linking {_account_title(account)}…")
+        threading.Thread(target=self._link_desktop_thread, args=(account,),
+                         name="calendar_desktop_link", daemon=True).start()
+
+    def _link_desktop_thread(self, account: dict) -> None:
+        # The primary calendar's id is the account's address - the same trick the OAuth flow
+        # uses - and listing it is the first real use of the desktop's token.
+        result = self.plugin_base.list_calendars(account.get("calendar_type") or "google",
+                                                 account["provider"], account["id"])
+        email = ""
+        for calendar in result.get("calendars") or []:
+            if calendar.get("primary") and "@" in str(calendar.get("id") or ""):
+                email = str(calendar["id"])
+                break
+        GLib.idle_add(self._on_desktop_linked, account, email, result)
+
+    def _on_desktop_linked(self, account: dict, email: str, result: dict) -> None:
+        # Linked even if the first token request failed: the account row's "Add calendars"
+        # retries, and in a Flatpak the fix is granting the permissions shown below.
+        self.plugin_base.add_account(account["provider"], account["id"],
+                                     label=account.get("label", ""), email=email,
+                                     calendar_type=account.get("calendar_type") or "google")
+        linked = dict(account, email=email)
+        self._refresh_sources()
+        if result.get("ok"):
+            self.status_label.set_label(f"Linked {email or _account_title(account)}")
+            self._show_calendar_picker(linked, result)
+        else:
+            self.status_label.set_label(f"Linked, but the desktop login failed: {result.get('error')}")
+            self._show_sandbox_hint()
+
+    def _show_sandbox_hint(self) -> None:
+        """In a Flatpak the desktop's accounts are outside the sandbox until the user grants
+        access; the app has a dialog for D-Bus names but not for filesystem paths, so the
+        override command is shown for them to run."""
+        if not self.plugin_base.is_flatpak():
+            return
+        commands = [c for c in (self.plugin_base.ensure_provider_permissions(p)
+                                for p in ("kde",)) if c]
+        if not commands:
+            return
+        dialog = Adw.AlertDialog(
+            heading="Let StreamController see your desktop accounts",
+            body=("StreamController runs in a Flatpak sandbox, which hides the desktop's account "
+                  "list. Run this once in a terminal, then restart StreamController:"),
+        )
+        dialog.set_extra_child(Gtk.Label(label="\n".join(commands), selectable=True, wrap=True,
+                                         xalign=0, css_classes=["monospace"]))
+        dialog.add_response("ok", "OK")
+        dialog.present(self)
+
+    # --- an account's calendars ------------------------------------------------------------------
+
+    def _pick_calendars(self, account: dict) -> None:
+        self.status_label.set_label("Loading calendars…")
+        threading.Thread(target=self._list_calendars_thread, args=(account,),
+                         name="calendar_list", daemon=True).start()
+
+    def _list_calendars_thread(self, account: dict) -> None:
+        result = self.plugin_base.list_calendars(account.get("calendar_type") or "google",
+                                                 account["provider"], account["id"])
+        GLib.idle_add(self._show_calendar_picker, account, result)
+
+    def _show_calendar_picker(self, account: dict, result: dict) -> None:
+        if not result.get("ok"):
+            self.status_label.set_label(result.get("error") or "Could not list calendars")
+            return
+        self.update_status()
+
+        already = {(c["account_provider"], c["account_id"], c["google_calendar"])
+                   for c in self.plugin_base.get_calendars()}
+        group = Adw.PreferencesGroup(
+            title=_escape(f"Calendars on {_account_title(account)}"),
+            description="Each one you add becomes a calendar entry with its own color and switch.",
+        )
+        checks: list[tuple[dict, Gtk.CheckButton]] = []
+        for calendar in result.get("calendars", []):
+            row = Adw.ActionRow(title=_escape(calendar.get("name") or calendar.get("id", "")),
+                                subtitle=_escape(calendar.get("id", "")))
+            if (account["provider"], account["id"], calendar.get("id")) in already:
+                row.set_subtitle("Already added")
+                row.set_sensitive(False)
+            else:
+                check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+                row.add_prefix(check)
+                row.set_activatable_widget(check)
+                checks.append((calendar, check))
+            group.add(row)
+
+        page = Adw.PreferencesPage()
+        page.add(group)
+        add_button = Gtk.Button(label="Add selected", css_classes=["suggested-action"])
+        dialog = Adw.Dialog(title="Add calendars", child=_with_header(page, add_button),
+                            content_width=560, content_height=560)
+        add_button.connect("clicked", self._on_add_account_calendars, dialog, account, checks)
+        dialog.present(self)
+
+    def _on_add_account_calendars(self, _button, dialog, account: dict, checks) -> None:
+        calendar_type = account.get("calendar_type") or "google"
+        added = []
+        for calendar, check in checks:
+            if not check.get_active():
+                continue
+            added.append({
+                "id": uuid.uuid4().hex,
+                "name": calendar.get("name") or "Calendar",
+                "type": calendar_type,
+                "source": "",
+                "account_provider": account["provider"],
+                "account_id": account["id"],
+                "google_calendar": calendar.get("id", ""),
+                "enabled": True,
+                "color": _rgba_from_hex(calendar.get("color", "")) or list(DEFAULT_COLOR),
+            })
+        dialog.close()
+        self.add_calendars(added)
+        if added:
+            self.status_label.set_label(f"Added {len(added)} calendar{'' if len(added) == 1 else 's'}")
+
+    # --- disconnecting an account -----------------------------------------------------------------
 
     def _confirm_disconnect(self, account: dict) -> None:
         dialog = Adw.AlertDialog(
@@ -424,122 +695,18 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
     def _on_disconnect_response(self, _dialog, response: str, account: dict) -> None:
         if response != "disconnect":
             return
-        # Revoking talks to Google, so drop the rows now and do the network part on a thread.
-        for calendar_id in [cid for cid, row in self._rows.items()
-                            if row.account_provider == account["provider"] and row.account_id == account["id"]]:
-            row = self._rows.pop(calendar_id, None)
-            if row is not None:
-                self.calendar_list.remove(row)
-        self._update_empty_row()
-        self.connect_status.set_label("Disconnecting…")
+        # Revoking talks to the network, so drop the rows now and do that part on a thread.
+        self.status_label.set_label("Disconnecting…")
         threading.Thread(target=self._disconnect_thread, args=(account,),
-                         name="calendar_google_disconnect", daemon=True).start()
+                         name="calendar_disconnect", daemon=True).start()
 
     def _disconnect_thread(self, account: dict) -> None:
         self.plugin_base.remove_account(account["provider"], account["id"])
         GLib.idle_add(self._on_disconnected)
 
     def _on_disconnected(self) -> None:
-        self._refresh_google_rows()
-        self.connect_status.set_label("Disconnected")
-
-    # --- desktop accounts (KDE Online Accounts today) ------------------------------------------
-    #
-    # No consent flow: the desktop already holds the login, the user just picks the account.
-    # The desktop's token daemon hands out short-lived tokens, so nothing is stored here.
-
-    def _on_link_desktop_clicked(self, button) -> None:
-        button.set_sensitive(False)
-        self.connect_status.set_label("Looking for desktop accounts…")
-        threading.Thread(target=self._list_desktop_thread, name="calendar_desktop_list", daemon=True).start()
-
-    def _list_desktop_thread(self) -> None:
-        result = self.plugin_base.list_desktop_accounts()
-        GLib.idle_add(self._show_desktop_picker, result)
-
-    def _show_desktop_picker(self, result: dict) -> None:
-        self.desktop_button.set_sensitive(True)
-        accounts = result.get("accounts") or []
-        if not accounts:
-            self.connect_status.set_label(
-                result.get("error") or "No desktop accounts found - add a Google account in "
-                "System Settings -> Online Accounts first")
-            self._show_sandbox_hint()
-            return
-        self.connect_status.set_label("")
-
-        linked = {(a["provider"], a["id"]) for a in self.plugin_base.get_accounts()}
-        dialog = Adw.Dialog(title="Link a desktop account", content_width=520, content_height=420)
-        group = Adw.PreferencesGroup(
-            title="Accounts on this desktop",
-            description="Linking uses the desktop's own login; this plugin stores no token for it.",
-        )
-        for account in accounts:
-            provider_label = PROVIDER_LABELS.get(account["provider"], account["provider"])
-            row = Adw.ActionRow(title=GLib.markup_escape_text(_account_title(account)),
-                                subtitle=GLib.markup_escape_text(provider_label))
-            if (account["provider"], account["id"]) in linked:
-                row.set_subtitle("Already linked")
-                row.set_sensitive(False)
-            else:
-                button = Gtk.Button(label="Link", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
-                button.connect("clicked", lambda _b, a=account: self._link_desktop_account(a, dialog))
-                row.add_suffix(button)
-            group.add(row)
-        page = Adw.PreferencesPage()
-        page.add(group)
-        toolbar = Adw.ToolbarView(content=page)
-        toolbar.add_top_bar(Adw.HeaderBar())
-        dialog.set_child(toolbar)
-        dialog.present(self)
-
-    def _link_desktop_account(self, account: dict, dialog) -> None:
-        dialog.close()
-        self.plugin_base.ensure_provider_permissions(account["provider"])
-        self.connect_status.set_label(f"Linking {_account_title(account)}…")
-        threading.Thread(target=self._link_desktop_thread, args=(account,),
-                         name="calendar_desktop_link", daemon=True).start()
-
-    def _link_desktop_thread(self, account: dict) -> None:
-        # The primary calendar's id is the account's address - the same trick the OAuth flow
-        # uses - and listing it is the first real use of the desktop's token.
-        result = self.plugin_base.list_calendars("google", account["provider"], account["id"])
-        email = ""
-        for calendar in result.get("calendars") or []:
-            if calendar.get("primary") and "@" in str(calendar.get("id") or ""):
-                email = str(calendar["id"])
-                break
-        GLib.idle_add(self._on_desktop_linked, account, email, result)
-
-    def _on_desktop_linked(self, account: dict, email: str, result: dict) -> None:
-        # Linked even if the first token request failed: the account row's "Add calendars"
-        # retries, and in a Flatpak the fix is granting the permissions shown above.
-        self.plugin_base.add_account(account["provider"], account["id"],
-                                     label=account.get("label", ""), email=email)
-        self._refresh_google_rows()
-        if result.get("ok"):
-            self.connect_status.set_label(f"Linked {email or _account_title(account)}")
-        else:
-            self.connect_status.set_label(f"Linked, but the desktop login failed: {result.get('error')}")
-
-    def _show_sandbox_hint(self) -> None:
-        """In a Flatpak the desktop's account list is outside the sandbox until the user grants
-        access; the app has a dialog for D-Bus names but not for filesystem paths, so the
-        override command is shown for them to run."""
-        commands = [self.plugin_base.ensure_provider_permissions(p) for p in DESKTOP_PROVIDERS]
-        commands = [c for c in commands if c]
-        if not commands:
-            return
-        dialog = Adw.AlertDialog(
-            heading="Let StreamController see your desktop accounts",
-            body=("StreamController runs in a Flatpak sandbox, which hides the desktop's account "
-                  "list. Run this once in a terminal, then restart StreamController:"),
-        )
-        label = Gtk.Label(label="\n".join(commands), selectable=True, wrap=True, xalign=0,
-                          css_classes=["monospace"])
-        dialog.set_extra_child(label)
-        dialog.add_response("ok", "OK")
-        dialog.present(self)
+        self._refresh_sources()
+        self.status_label.set_label("Disconnected")
 
     # --- setup guide -------------------------------------------------------------------------
 
@@ -576,122 +743,19 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             notes.add(Adw.ActionRow(title=title, subtitle=subtitle, subtitle_lines=3))
         page.add(notes)
 
-        header = Adw.HeaderBar()
-        toolbar = Adw.ToolbarView(content=page)
-        toolbar.add_top_bar(header)
-        dialog = Adw.Dialog(title="Google Calendar setup", child=toolbar,
+        dialog = Adw.Dialog(title="Google Calendar setup", child=_with_header(page),
                             content_width=620, content_height=620)
         dialog.present(self)
-
-    # --- calendar picker ---------------------------------------------------------------------
-
-    def _pick_google_calendars(self, account: dict) -> None:
-        self.connect_status.set_label("Loading calendars…")
-        threading.Thread(target=self._list_calendars_thread, args=(account,),
-                         name="calendar_google_list", daemon=True).start()
-
-    def _list_calendars_thread(self, account: dict) -> None:
-        result = self.plugin_base.list_calendars("google", account["provider"], account["id"])
-        GLib.idle_add(self._show_calendar_picker, account, result)
-
-    def _show_calendar_picker(self, account: dict, result: dict) -> None:
-        if not result.get("ok"):
-            self.connect_status.set_label(result.get("error") or "Could not list calendars")
-            return
-        self.connect_status.set_label("")
-
-        already = {(c["account_provider"], c["account_id"], c["google_calendar"])
-                   for c in self.plugin_base.get_calendars()}
-        group = Adw.PreferencesGroup(
-            title=f"Calendars on {GLib.markup_escape_text(_account_title(account))}",
-            description="Each one you add becomes a calendar entry with its own color and switch.",
-        )
-        checks: list[tuple[dict, Gtk.CheckButton]] = []
-        for calendar in result.get("calendars", []):
-            row = Adw.ActionRow(title=calendar.get("name") or calendar.get("id", ""),
-                                subtitle=calendar.get("id", ""))
-            if (account["provider"], account["id"], calendar.get("id")) in already:
-                row.set_subtitle("Already added")
-                row.set_sensitive(False)
-            else:
-                check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-                row.add_prefix(check)
-                row.set_activatable_widget(check)
-                checks.append((calendar, check))
-            group.add(row)
-
-        page = Adw.PreferencesPage()
-        page.add(group)
-        header = Adw.HeaderBar()
-        add_button = Gtk.Button(label="Add selected", css_classes=["suggested-action"])
-        header.pack_end(add_button)
-        toolbar = Adw.ToolbarView(content=page)
-        toolbar.add_top_bar(header)
-        dialog = Adw.Dialog(title="Add Google calendars", child=toolbar,
-                            content_width=560, content_height=560)
-        add_button.connect("clicked", self._on_add_google_calendars, dialog, account, checks)
-        dialog.present(self)
-
-    def _on_add_google_calendars(self, _button, dialog, account: dict, checks) -> None:
-        added = 0
-        for calendar, check in checks:
-            if not check.get_active():
-                continue
-            self._add_row({
-                "id": uuid.uuid4().hex,
-                "name": calendar.get("name") or "Google calendar",
-                "type": "google",
-                "source": "",
-                "account_provider": account["provider"],
-                "account_id": account["id"],
-                "google_calendar": calendar.get("id", ""),
-                "enabled": True,
-                "color": _rgba_from_hex(calendar.get("color", "")) or list(DEFAULT_COLOR),
-            })
-            added += 1
-        dialog.close()
-        if added:
-            self._update_empty_row()
-            self._save_calendars()
-            self.plugin_base.refresh_now()
-            self.connect_status.set_label(f"Added {added} calendar{'' if added == 1 else 's'}")
-
-    # --- calendar rows ---------------------------------------------------------------------
-
-    def _on_add_clicked(self, button) -> None:
-        calendar = {"id": uuid.uuid4().hex, "name": "New calendar", "source": "", "enabled": True, "color": list(DEFAULT_COLOR)}
-        row = self._add_row(calendar)
-        self._update_empty_row()
-        row.set_expanded(True)
-        self._save_calendars()
-
-    def _add_row(self, calendar: dict) -> "CalendarRow":
-        row = CalendarRow(self, calendar)
-        self._rows[calendar["id"]] = row
-        self.calendar_list.append(row)
-        return row
-
-    def remove_calendar(self, calendar_id: str) -> None:
-        row = self._rows.pop(calendar_id, None)
-        if row is not None:
-            self.calendar_list.remove(row)
-        self._update_empty_row()
-        self._save_calendars()
-
-    def _update_empty_row(self) -> None:
-        has_rows = bool(self._rows)
-        if not has_rows and self.empty_row.get_parent() is None:
-            self.calendar_list.append(self.empty_row)
-        elif has_rows and self.empty_row.get_parent() is not None:
-            self.calendar_list.remove(self.empty_row)
 
     # --- status ----------------------------------------------------------------------------
 
     def update_status(self) -> None:
         store = self.plugin_base.event_store
         statuses = store.get_statuses()
-        for calendar_id, row in self._rows.items():
+        for calendar_id, row in self._calendar_rows.items():
             row.update_status(statuses.get(calendar_id))
+        for row in self._account_rows.values():
+            row.update_status(statuses)
 
         if not store.is_backend_connected():
             text = "Starting calendar service…"
@@ -710,17 +774,70 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         self.status_label.set_label(text)
 
 
-def _account_title(account: dict) -> str:
-    return account.get("email") or account.get("label") or "Account"
+def _with_header(page, end_button=None):
+    """An Adw page wrapped in the toolbar view every dialog here uses."""
+    header = Adw.HeaderBar()
+    if end_button is not None:
+        header.pack_end(end_button)
+    toolbar = Adw.ToolbarView(content=page)
+    toolbar.add_top_bar(header)
+    return toolbar
+
+
+class AccountRow(Adw.ExpanderRow):
+    """One linked account and the calendars read through it."""
+
+    def __init__(self, group: CalendarSettingsGroup, account: dict, calendars: list[dict]):
+        super().__init__(title=_escape(_account_title(account)),
+                         subtitle=_escape(_provider_label(account["provider"])))
+        self.group = group
+        self.account = account
+        self.calendar_rows: list[CalendarRow] = []
+
+        for calendar in calendars:
+            row = CalendarRow(group, calendar)
+            self.add_row(row)
+            group.register_calendar_row(row)
+            self.calendar_rows.append(row)
+
+        if not calendars:
+            self.add_row(Adw.ActionRow(title="No calendars from this account yet",
+                                       subtitle="Press Add calendars to choose some"))
+
+        actions = Adw.ActionRow(title="Manage this account")
+        add_button = Gtk.Button(label="Add calendars", valign=Gtk.Align.CENTER)
+        add_button.connect("clicked", lambda *a: self.group._pick_calendars(self.account))
+        actions.add_suffix(add_button)
+        remove_button = Gtk.Button(label="Disconnect", valign=Gtk.Align.CENTER,
+                                   css_classes=["destructive-action"])
+        remove_button.connect("clicked", lambda *a: self.group._confirm_disconnect(self.account))
+        actions.add_suffix(remove_button)
+        self.add_row(actions)
+
+    def update_status(self, statuses: dict) -> None:
+        provider = _provider_label(self.account["provider"])
+        count = len(self.calendar_rows)
+        if not count:
+            self.set_subtitle(_escape(f"{provider} · no calendars"))
+            return
+        broken = sum(1 for row in self.calendar_rows
+                     if (status := statuses.get(row.calendar_id)) is not None and not status.ok)
+        suffix = f" · {broken} needs attention" if broken else ""
+        plural = "" if count == 1 else "s"
+        self.set_subtitle(_escape(f"{provider} · {count} calendar{plural}{suffix}"))
 
 
 class CalendarRow(Adw.ExpanderRow):
+    """One configured calendar: either standalone (an .ics feed, with its address here) or one
+    read through an account, in which case the account row above owns the connection details."""
+
     def __init__(self, group: CalendarSettingsGroup, calendar: dict):
-        super().__init__(title=calendar["name"] or "Calendar", subtitle="")
+        super().__init__(title=_escape(calendar["name"] or "Calendar"), subtitle="")
         self.group = group
+        self.calendar = dict(calendar)
         self.calendar_id = calendar["id"]
         self.calendar_type = calendar.get("type") or "ics"
-        self.account_provider = calendar.get("account_provider") or DEFAULT_ACCOUNT_PROVIDER
+        self.account_provider = calendar.get("account_provider") or ""
         self.account_id = calendar.get("account_id", "")
         self.google_calendar = calendar.get("google_calendar", "")
         self.source_row = None
@@ -738,9 +855,8 @@ class CalendarRow(Adw.ExpanderRow):
         self.name_row.connect("apply", self._on_name_applied)
         self.add_row(self.name_row)
 
-        # One builder per calendar type; a new type adds an entry here.
-        builders = {"google": self._build_google_rows, "ics": self._build_ics_rows}
-        builders.get(self.calendar_type, self._build_ics_rows)(calendar)
+        if not self.account_id:
+            self._build_standalone_rows(calendar)
 
         remove_button = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER, css_classes=["destructive-action"])
         remove_button.connect("clicked", lambda *a: self.group.remove_calendar(self.calendar_id))
@@ -748,19 +864,7 @@ class CalendarRow(Adw.ExpanderRow):
         remove_row.add_suffix(remove_button)
         self.add_row(remove_row)
 
-    def _build_google_rows(self, calendar: dict) -> None:
-        # A Google calendar is addressed by account + calendar id, both chosen in the
-        # picker, so there is nothing here to type - or to test separately: the account's
-        # own status row already reports what the last fetch did.
-        account = next((a for a in self.group.plugin_base.get_accounts()
-                        if a["provider"] == self.account_provider and a["id"] == self.account_id), None)
-        self.add_row(Adw.ActionRow(
-            title="Google account",
-            subtitle=GLib.markup_escape_text(_account_title(account)) if account else "Account no longer linked",
-        ))
-        self.add_row(Adw.ActionRow(title="Calendar", subtitle=self.google_calendar or "-"))
-
-    def _build_ics_rows(self, calendar: dict) -> None:
+    def _build_standalone_rows(self, calendar: dict) -> None:
         self.source_row = Adw.EntryRow(
             title="Address (.ics URL, webcal:// or file path) - press Enter to apply",
             text=calendar.get("source", ""), show_apply_button=True,
@@ -771,7 +875,8 @@ class CalendarRow(Adw.ExpanderRow):
         self.test_label = Gtk.Label(label="", css_classes=["dim-label"], wrap=True, xalign=1, max_width_chars=40)
         self.test_button = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
         self.test_button.connect("clicked", self._on_test_clicked)
-        test_row = Adw.ActionRow(title="Check this calendar", subtitle="Fetches the address once and reports what it found")
+        test_row = Adw.ActionRow(title="Check this calendar",
+                                 subtitle="Fetches the address once and reports what it found")
         test_row.add_suffix(self.test_label)
         test_row.add_suffix(self.test_button)
         self.add_row(test_row)
@@ -790,7 +895,7 @@ class CalendarRow(Adw.ExpanderRow):
         }
 
     def _on_name_applied(self, *args) -> None:
-        self.set_title(self.name_row.get_text().strip() or "Calendar")
+        self.set_title(_escape(self.name_row.get_text().strip() or "Calendar"))
         self.group._save_calendars()
 
     def update_status(self, status) -> None:
@@ -799,7 +904,7 @@ class CalendarRow(Adw.ExpanderRow):
         elif self.source_row is not None and not self.source_row.get_text().strip():
             self.set_subtitle("No address set")
         elif status is not None and status.needs_reauth:
-            self.set_subtitle(f"Reconnect needed: {status.error}")
+            self.set_subtitle(_escape(f"Reconnect needed: {status.error}"))
         elif status is None:
             self.set_subtitle("Not fetched yet")
         elif status.ok:
@@ -807,7 +912,7 @@ class CalendarRow(Adw.ExpanderRow):
             self.set_subtitle(f"{status.event_count} event{plural} in the fetch window")
         else:
             suffix = " (showing last good copy)" if status.from_cache else ""
-            self.set_subtitle(f"Error: {status.error}{suffix}")
+            self.set_subtitle(_escape(f"Error: {status.error}{suffix}"))
 
     def _on_test_clicked(self, button) -> None:
         source = self.source_row.get_text().strip()

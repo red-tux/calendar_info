@@ -64,15 +64,24 @@ can only be exercised in the app.
   address or file in `source`, `google` for `google_calendar` read through an account) and,
   where the source needs one, an *account provider* (`account_provider` + `account_id`;
   `oauth` = the user's own Google OAuth client). `backend/sources.py::SOURCES` maps `type` to
-  a `CalendarSource` (`fetch`, `load_cached`, `list_calendars`); `backend/accounts/registry.py::PROVIDERS`
+  a `CalendarSource` (`fetch`, `load_cached`, `list_calendars`); `backend/accounts/registry.py::PROVIDER_CLASSES`
   maps `account_provider` to an `AccountProvider` (`get_credential`, `list_accounts`,
   `forget`, `required_permissions`). A source asks the calendar's provider for a `Credential`
   (bearer token or username/password) and never learns where it came from; every source
   produces `CalendarEvent`s, so nothing downstream - event_store, the actions, rendering -
   knows which source or provider an event came from. **Adding a source (CalDAV) or a provider
-  (KDE/GNOME Online Accounts, a stored password) is one module plus one registry entry**; the
+  (GNOME Online Accounts, a stored password) is one module plus one registry entry**; the
   poll loop, the RPyC surface, `main.py`'s account bookkeeping and the settings list rendering
   are keyed by these strings and must stay that way.
+- **Discovery decides the type, not the user.** A `CalendarSource` declares `account_kinds` -
+  which kinds of discovered account it can read (`GoogleSource` = `("google",)`) - plus a
+  `label` and `manual_fields` for the settings UI, exposed together by
+  `sources.py::describe_sources()`. A provider's discovery sets `AccountInfo.kind` (what the
+  account *is*), and `sources.py::classify_account_kind()` resolves that against the registered
+  sources into `calendar_type` / `supported` / `detail`. So a Nextcloud account on the desktop
+  is already found and reported today as "CalDAV … support is not built yet"; adding a
+  `CalDavSource` with `account_kinds = ("dav",)` is what makes it work, with no change to
+  discovery or the UI.
 
 **Everything crossing RPyC is JSON text** (`backend.configure(json)`, `frontend.on_events_update(json)`,
 `backend.test_source(calendar_json) -> json`, `backend.list_accounts(provider) -> json`,
@@ -104,9 +113,15 @@ verified one commits the project to brand review and re-verification.
   the reply's short-lived access token is cached in memory and **nothing is written to
   disk** - the refresh token stays in the desktop. `call_sync` needs no GLib main loop, so
   none runs in the backend. The bus is `$CALENDAR_INFO_ACCOUNTS_DBUS_ADDRESS` when set (the
-  dev container's host bus), else this process's session bus. Only `SUPPORTED_PROVIDERS`
-  (`google`) are offered; a password-method account (Nextcloud) would map to a basic
-  credential for a future CalDAV source. `required_permissions()` lists the Flatpak grants.
+  dev container's host bus), else this process's session bus. Every enabled account is
+  returned, classified by the `PROVIDER_KINDS` table - which has to live here because
+  kaccounts-providers ships **no calendar service** for either google or nextcloud (its
+  `nextcloud-contacts.service` even carries an "enable once Akonadi supports CalDAV" note, and
+  `service_types/` is empty), so the desktop's own metadata cannot answer "can this account do
+  calendars". A password-method account (Nextcloud) returns a basic credential, ready for a
+  future CalDAV source; note `_auth_data_via_db` reads only account-global settings
+  (`service = 0`), so that source will also need the service-scoped `dav/host` rows.
+  `required_permissions()` lists the Flatpak grants.
 - `backend/google_source.py` - `TokenStore` (one 0600 JSON file per account under
   `credentials/`, created 0600 rather than chmod-ed afterwards), `GoogleClient` (takes a
   provider + account id, one forced-refresh retry on a 401, error mapping) and `map_event()`,
@@ -142,15 +157,22 @@ verified one commits the project to brand review and re-verification.
 - `actions/NextEvent`, `actions/Agenda`, `actions/UpcomingDial` - the actions. Each `render()`
   builds a tuple of everything that affects the display, compares it with `_last_render_key`,
   and only pushes to the hardware on change.
-- `settings_area.py` - `CalendarSettingsGroup(Adw.PreferencesGroup)`: option rows, the accounts
-  section (OAuth client id/secret, Connect, "Link a desktop account" for `DESKTOP_PROVIDERS`,
-  linked accounts labelled by `PROVIDER_LABELS`, the setup-guide dialog and the
-  `calendarList`-driven calendar picker), then the calendar list of `CalendarRow(Adw.ExpanderRow)`;
-  must stay a single `PreferencesGroup` because the app adds it to an `Adw.PreferencesPage`.
-  Linking a desktop account lists its calendars once to learn the address (the primary
-  calendar's id) and links even if that first token request fails, so "Add calendars" can retry
-  after permissions are fixed. `CalendarRow` builds its rows per `type` (`_build_google_rows`,
-  `_build_ics_rows`); a Google entry has no address/Test rows - there is nothing to type.
+- `settings_area.py` - `CalendarSettingsGroup(Adw.PreferencesGroup)`: option rows, then one
+  **"Calendar sources"** list. Must stay a single `PreferencesGroup` because the app adds it to
+  an `Adw.PreferencesPage`. A source is either an `AccountRow` (an `Adw.ExpanderRow` holding the
+  `CalendarRow`s read through that account, plus *Add calendars* / *Disconnect*) or a standalone
+  `CalendarRow` (an `.ics` feed, which has no account). `_refresh_sources()` rebuilds the list
+  after structural changes only - `_save_calendars()` deliberately does not, or the row being
+  edited would be destroyed under the cursor - and every calendar row, nested or not, is
+  registered in `_calendar_rows` so saving and status updates stay flat.
+  The single `+` opens an `Adw.NavigationView` dialog whose choices come from the backend:
+  `describe_sources()` for what can be added by hand (an entry row per `manual_fields` entry, so
+  a new manual type needs no code here) and `list_desktop_accounts()` for what the desktop
+  already has. Discovered accounts that nothing can read yet are shown insensitive with their
+  `detail` as the subtitle rather than hidden. Linking (either path) lists the account's
+  calendars once to learn its address (the primary calendar's id), links even if that first
+  token request fails so *Add calendars* can retry, and then opens the calendar picker - linking
+  is only half the job.
 - Flatpak grants for desktop providers go through `CalendarInfoPlugin.ensure_provider_permissions()`:
   D-Bus names via the app's `request_dbus_permission()` dialog, filesystem paths as a
   `flatpak override --user` line the UI shows (`_show_sandbox_hint`) because the app has no
@@ -188,8 +210,10 @@ guard), resets the render cache, and repaints. `on_disconnect()` unsubscribes an
 
 - **Plugin-level** (`PluginBase.get_settings()/set_settings()`): `calendars` (list of
   `{id, name, type, source, account_provider, account_id, google_calendar, enabled, color}`),
-  `accounts` (list of `{provider, id, label, email}` - names only, never tokens; entries saved
-  before providers existed sit under `google.accounts` and are read as `oauth` ones), `google`
+  `accounts` (list of `{provider, id, label, email, calendar_type}` - names only, never tokens;
+  entries saved before providers existed sit under `google.accounts` and are read as `oauth`
+  ones, and entries with no `calendar_type` can only be Google - both are normalised on read in
+  `get_accounts()`, so there is no migration step), `google`
   (`{client_id, client_secret}` - the OAuth provider's own client), `refresh_minutes`,
   `days_ahead`, `time_format`, `hide_all_day`. UI is hand-built in `settings_area.py`; any change goes through
   `CalendarInfoPlugin.on_settings_changed()` which refreshes `self.options`, re-pushes the

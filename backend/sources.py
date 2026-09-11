@@ -43,6 +43,18 @@ class SourceContext:
 
 class CalendarSource:
     type_id = ""
+    label = ""
+    # Account kinds (as a provider's discovery reports them) this source can read. A new
+    # source declaring a kind is all it takes for accounts of that kind, already discovered
+    # and listed as unsupported, to start working.
+    account_kinds: tuple[str, ...] = ()
+    # What a hand-added calendar of this type needs typed in; empty when it comes from an
+    # account. Each entry is {key, label, placeholder} and names a field of the calendar entry.
+    manual_fields: tuple[dict, ...] = ()
+
+    @property
+    def needs_account(self) -> bool:
+        return bool(self.account_kinds)
 
     def fetch(self, calendar: dict, window_start: datetime, window_end: datetime,
               ctx: SourceContext) -> list[CalendarEvent]:
@@ -59,6 +71,9 @@ class CalendarSource:
 
 class IcsSource(CalendarSource):
     type_id = "ics"
+    label = "iCalendar address or file"
+    manual_fields = ({"key": "source", "label": "Address",
+                      "placeholder": ".ics URL, webcal:// or file path"},)
 
     def fetch(self, calendar, window_start, window_end, ctx):
         calendar_id = str(calendar.get("id") or "")
@@ -84,6 +99,8 @@ class GoogleSource(CalendarSource):
     """Google Calendar API. Which account provider hands over the token is the calendar's
     `account_provider`; the fetch is the same either way."""
     type_id = "google"
+    label = "Google Calendar"
+    account_kinds = ("google",)
 
     def fetch(self, calendar, window_start, window_end, ctx):
         calendar_id = str(calendar.get("id") or "")
@@ -109,6 +126,39 @@ def source_for(calendar: dict) -> CalendarSource:
     if source is None:
         raise SourceError(f"Unknown calendar type {name!r}")
     return source
+
+
+# How an account kind reads in the UI when nothing can serve it yet.
+KIND_LABELS = {
+    "google": "Google",
+    "dav": "CalDAV (Nextcloud, ownCloud)",
+    "exchange": "Exchange",
+}
+
+
+def classify_account_kind(kind: str) -> tuple[str, bool, str]:
+    """(calendar type, supported, why not) for an account a provider discovered."""
+    for source in SOURCES.values():
+        if kind and kind in source.account_kinds:
+            return source.type_id, True, ""
+    if not kind:
+        return "", False, "Calendar Info does not recognise this kind of account"
+    return "", False, f"{KIND_LABELS.get(kind, 'This kind of account')} support is not built yet"
+
+
+def describe_sources(providers: dict) -> list[dict]:
+    """What the settings UI needs to build its add-a-source choices without knowing any type
+    by name: one entry per registered source, naming the manual providers that can
+    authenticate it (discoverable ones speak through `list_accounts` instead)."""
+    return [{
+        "id": source.type_id,
+        "label": source.label or source.type_id,
+        "needs_account": source.needs_account,
+        "manual_fields": [dict(field) for field in source.manual_fields],
+        "account_kinds": list(source.account_kinds),
+        "providers": sorted(provider_id for provider_id, provider in providers.items()
+                            if not provider.discoverable and source.type_id in provider.calendar_types),
+    } for source in SOURCES.values()]
 
 
 # --- last-good-copy cache -------------------------------------------------------------------
