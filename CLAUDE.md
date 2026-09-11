@@ -173,10 +173,20 @@ verified one commits the project to brand review and re-verification.
   calendars once to learn its address (the primary calendar's id), links even if that first
   token request fails so *Add calendars* can retry, and then opens the calendar picker - linking
   is only half the job.
-- Flatpak grants for desktop providers go through `CalendarInfoPlugin.ensure_provider_permissions()`:
-  D-Bus names via the app's `request_dbus_permission()` dialog, filesystem paths as a
-  `flatpak override --user` line the UI shows (`_show_sandbox_hint`) because the app has no
-  dialog for those. Both are user-level overrides; the app's manifest is not touched.
+- Flatpak grants for desktop providers are driven by each provider's `required_permissions()`.
+  `missing_provider_permissions()` *reports* what the sandbox lacks (safe on a worker thread -
+  it shells out to `flatpak info`), and `ensure_provider_permissions()` additionally asks for
+  each missing D-Bus name through the app's `request_dbus_permission()` dialog. Whatever is
+  still missing comes back as `flatpak override --user` lines that the UI shows
+  (`_show_permission_commands`) - the dialog can be dismissed, and the app has none at all for
+  filesystem paths. The add dialog reports missing grants up front rather than waiting for a
+  token request to fail with a raw D-Bus error: discovery only reads a file, so accounts list
+  fine while the login service is still out of reach. User-level overrides either way; the
+  app's manifest is not touched. The KDE provider needs only the bus name -
+  the account database is under the user's home, already covered by the manifest's
+  `--filesystem=home`. **A Flatpak redirects `XDG_CONFIG_HOME` to `~/.var/app/<id>/config`**,
+  so `candidate_db_paths()` falls back to the real `~/.config`; trusting the variable alone
+  made the provider invisible in every Flatpak install.
 
 ### Threading model
 

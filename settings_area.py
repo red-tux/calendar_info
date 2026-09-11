@@ -335,9 +335,13 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
     def _load_add_options(self) -> None:
         sources = self.plugin_base.describe_sources()
         discovered = self.plugin_base.list_desktop_accounts()
-        GLib.idle_add(self._populate_add_dialog, sources, discovered)
+        # Reporting only - asking would pop the app's permission dialog at someone who may
+        # only want to paste an .ics address.
+        missing = self.plugin_base.missing_provider_permissions("kde")
+        GLib.idle_add(self._populate_add_dialog, sources, discovered, missing)
 
-    def _populate_add_dialog(self, sources: list[dict], discovered: dict) -> None:
+    def _populate_add_dialog(self, sources: list[dict], discovered: dict,
+                             missing: list[str]) -> None:
         if self._add_dialog is None:
             return
         page = Adw.PreferencesPage()
@@ -367,6 +371,19 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
                 "No accounts found. Add one in System Settings → Online Accounts, or use a "
                 "manual option below.")
             desktop.add(Adw.ActionRow(title="Nothing to link", subtitle=_escape(message), subtitle_lines=3))
+        if missing:
+            # Discovery only reads a file, so accounts can be listed while the login service is
+            # still out of reach - say so here rather than at the first failed token request.
+            row = Adw.ActionRow(
+                title="One permission is still needed",
+                subtitle="StreamController's sandbox cannot reach the service that hands out "
+                         "your desktop's logins yet.",
+                subtitle_lines=3,
+            )
+            button = Gtk.Button(label="Show command", valign=Gtk.Align.CENTER)
+            button.connect("clicked", lambda *a: self._show_permission_commands(missing))
+            row.add_suffix(button)
+            desktop.add(row)
         page.add(desktop)
 
         manual = Adw.PreferencesGroup(title="Add manually")
@@ -588,22 +605,19 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
             self._show_calendar_picker(linked, result)
         else:
             self.status_label.set_label(f"Linked, but the desktop login failed: {result.get('error')}")
-            self._show_sandbox_hint()
+            self._show_permission_commands(self.plugin_base.ensure_provider_permissions(account["provider"]))
 
-    def _show_sandbox_hint(self) -> None:
-        """In a Flatpak the desktop's accounts are outside the sandbox until the user grants
-        access; the app has a dialog for D-Bus names but not for filesystem paths, so the
-        override command is shown for them to run."""
-        if not self.plugin_base.is_flatpak():
-            return
-        commands = [c for c in (self.plugin_base.ensure_provider_permissions(p)
-                                for p in ("kde",)) if c]
+    def _show_permission_commands(self, commands: list[str]) -> None:
+        """A Flatpak hides the desktop's login service until the user grants the bus name. The
+        app's own dialog asks for it, but it can be dismissed - and nothing asks for filesystem
+        paths - so whatever is still missing is shown as a command to run."""
         if not commands:
             return
         dialog = Adw.AlertDialog(
-            heading="Let StreamController see your desktop accounts",
-            body=("StreamController runs in a Flatpak sandbox, which hides the desktop's account "
-                  "list. Run this once in a terminal, then restart StreamController:"),
+            heading="Let StreamController reach your desktop accounts",
+            body=("StreamController runs in a Flatpak sandbox, which hides the service that "
+                  "hands out your desktop's logins. Run this once in a terminal, then restart "
+                  "StreamController:"),
         )
         dialog.set_extra_child(Gtk.Label(label="\n".join(commands), selectable=True, wrap=True,
                                          xalign=0, css_classes=["monospace"]))

@@ -96,11 +96,17 @@ Accounts of a kind Calendar Info cannot read yet - a Nextcloud account, say - ar
 too, greyed out and labelled with what is missing, so you can see what a future version will
 pick up.
 
-Two notes for the Flatpak build of StreamController: the sandbox hides the desktop's account
-list and its login service, so the first time you link, the plugin asks for the D-Bus permission
-through StreamController's own dialog and shows a one-line `flatpak override` command for the
-file access. Run it, restart StreamController, and link again. Nothing in StreamController's
-own packaging changes.
+On the Flatpak build of StreamController, the sandbox hides the desktop's login service, so the
+first time you link an account the plugin asks for that permission through StreamController's
+own dialog. If you would rather grant it up front, or the dialog does not appear:
+
+```sh
+flatpak override --user --talk-name=com.google.code.AccountsSSO.SingleSignOn com.core447.StreamController
+flatpak kill com.core447.StreamController      # overrides only apply at sandbox setup
+```
+
+Nothing else is needed: the account database lives under your home directory, which
+StreamController's manifest already grants access to, and nothing in its packaging changes.
 
 ### When something goes wrong
 
@@ -112,7 +118,7 @@ own packaging changes.
 | "The Google Calendar API is not enabled…" | Step 2 was skipped or ran against another project. The message carries the exact link to enable it. |
 | "Reconnect needed" on a calendar | Access was revoked (password change, or removed at [myaccount.google.com/permissions](https://myaccount.google.com/permissions)). Connect the account again. |
 | "KDE Online Accounts could not provide a login…" | The desktop's stored login has expired or been revoked. Open *System Settings → Online Accounts*, re-authenticate the account, then refresh. In a Flatpak, also check the two permissions described above. |
-| "No desktop accounts found" | No Google account in *System Settings → Online Accounts* yet - or, in a Flatpak, the file access hasn't been granted (the plugin shows the command). |
+| "No desktop accounts found" | No Google account in *System Settings → Online Accounts* yet. |
 
 ## The actions
 

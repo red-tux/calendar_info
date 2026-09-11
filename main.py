@@ -453,22 +453,38 @@ class CalendarInfoPlugin(PluginBase):
             log.warning(f"Could not read {provider} permissions: {e}")
             return {"dbus": [], "filesystem": []}
 
-    def ensure_provider_permissions(self, provider: str) -> str:
-        """Main thread, Flatpak only (empty string elsewhere). Requests each D-Bus name through
-        the app's own permission dialog and returns the `flatpak override` line for the
-        filesystem paths, for the UI to show - the app has no dialog for those."""
+    def missing_provider_permissions(self, provider: str) -> list[str]:
+        """`flatpak override` lines for what this provider needs and the sandbox has not been
+        granted; empty outside a Flatpak, where nothing is sandboxed. Reports only - nothing is
+        requested, so this is safe to call from a worker thread (it shells out to
+        `flatpak info`)."""
         if not self.is_flatpak():
-            return ""
+            return []
+        manager = gl.flatpak_permission_manager
         needed = self.provider_permissions(provider)
-        for name in needed.get("dbus") or []:
-            self.request_dbus_permission(
-                name, "session",
-                f"Calendar Info needs to talk to {name} to use the accounts set up in your desktop.")
+        commands = [manager.get_dbus_permission_add_command(name, "session")
+                    for name in (needed.get("dbus") or [])
+                    if not manager.has_dbus_permission(name, "session")]
         paths = needed.get("filesystem") or []
-        if not paths:
-            return ""
-        return ("flatpak override --user " + " ".join(f"--filesystem={p}" for p in paths)
-                + f" {gl.flatpak_permission_manager.app_id}")
+        if paths:
+            commands.append("flatpak override --user "
+                            + " ".join(f"--filesystem={p}" for p in paths)
+                            + f" {manager.app_id}")
+        return commands
+
+    def ensure_provider_permissions(self, provider: str) -> list[str]:
+        """Main thread, Flatpak only. Asks for each missing D-Bus name through the app's own
+        permission dialog, then reports whatever is still missing - that dialog can be
+        dismissed, and the app has no dialog at all for filesystem paths."""
+        if not self.is_flatpak():
+            return []
+        manager = gl.flatpak_permission_manager
+        for name in self.provider_permissions(provider).get("dbus") or []:
+            if not manager.has_dbus_permission(name, "session"):
+                self.request_dbus_permission(
+                    name, "session",
+                    f"Calendar Info needs to talk to {name} to use the accounts set up in your desktop.")
+        return self.missing_provider_permissions(provider)
 
     def google_start_auth(self, client_id: str, client_secret: str) -> dict:
         """Ask the backend to open a consent flow. Returns {"ok", "flow_id", "auth_url", "error"}."""

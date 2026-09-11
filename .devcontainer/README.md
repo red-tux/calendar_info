@@ -139,14 +139,14 @@ It never requests a token, so it cannot touch the account itself.
 - The account database is mounted **read-only**. If libaccounts-glib refuses to open it that
   way, `post-start.sh` says so and falls back to a copy - which then goes stale, so restart
   the container after changing accounts on the host.
-- Flatpak users of the released plugin need two `flatpak override --user` grants, because
-  StreamController's manifest can't know about them: the session-bus name
-  `com.google.code.AccountsSSO.SingleSignOn` (the plugin requests it through the app's own
-  permission dialog) and read access to `xdg-config/libaccounts-glib` and `/usr/share/accounts`
-  (the app has no dialog for filesystem grants, so the plugin shows the command to run). The
-  GI typelibs installed here are a convenience: the plugin falls back to reading the account
-  database and provider XML directly when `Accounts-1.0` isn't importable, which is the case
-  inside the Flatpak.
+- Flatpak users of the released plugin need one `flatpak override --user` grant, the session-bus
+  name `com.google.code.AccountsSSO.SingleSignOn`, which the plugin requests through the app's
+  own permission dialog. The account database needs nothing: it is under the user's home, which
+  StreamController's manifest already grants. `/usr/share/accounts` cannot be granted at all -
+  a Flatpak cannot mount a host path over the runtime's `/usr` - and is not needed, since an
+  account carries its own copy of the auth parameters. The GI typelibs installed here are a
+  convenience: the plugin falls back to reading the account database and provider XML directly
+  when `Accounts-1.0` isn't importable, which is the case inside the Flatpak.
 
 ## Why Pillow is rebuilt
 

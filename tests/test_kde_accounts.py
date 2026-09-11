@@ -12,6 +12,7 @@ from backend.accounts.kde import (
     SIGNOND_NAME,
     KdeAccountsProvider,
     _credential_from_reply,
+    candidate_db_paths,
     parse_variant_text,
 )
 from backend.accounts.registry import PROVIDER_CLASSES
@@ -66,6 +67,56 @@ class ParseTests(unittest.TestCase):
             _credential_from_reply({"Scope": ["x"]})
 
 
+class DatabaseLocationTests(unittest.TestCase):
+    """A Flatpak redirects XDG_CONFIG_HOME to the app's own ~/.var/app/<id>/config, which never
+    holds the desktop's accounts - the real ~/.config does, and stays readable through the
+    app's --filesystem=home."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.home = os.path.join(self._dir.name, "home")
+        self.sandboxed = os.path.join(self._dir.name, "var", "app", "com.core447.StreamController", "config")
+        os.makedirs(os.path.join(self.home, ".config", "libaccounts-glib"))
+        os.makedirs(self.sandboxed)
+        self.real_db = os.path.join(self.home, ".config", "libaccounts-glib", "accounts.db")
+        with open(self.real_db, "w", encoding="utf-8") as f:
+            f.write("")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_the_real_home_is_used_when_xdg_config_home_is_redirected(self):
+        with mock.patch.dict(os.environ, {"HOME": self.home, "XDG_CONFIG_HOME": self.sandboxed}, clear=False):
+            os.environ.pop("ACCOUNTS", None)
+            self.assertEqual(KdeAccountsProvider().db_path, self.real_db)
+            self.assertTrue(KdeAccountsProvider().available())
+
+    def test_xdg_config_home_wins_when_it_has_the_database(self):
+        preferred = os.path.join(self.sandboxed, "libaccounts-glib", "accounts.db")
+        os.makedirs(os.path.dirname(preferred))
+        with open(preferred, "w", encoding="utf-8") as f:
+            f.write("")
+        with mock.patch.dict(os.environ, {"HOME": self.home, "XDG_CONFIG_HOME": self.sandboxed}, clear=False):
+            os.environ.pop("ACCOUNTS", None)
+            self.assertEqual(KdeAccountsProvider().db_path, preferred)
+
+    def test_accounts_override_comes_first(self):
+        with mock.patch.dict(os.environ, {"HOME": self.home, "ACCOUNTS": "/somewhere"}, clear=False):
+            self.assertEqual(candidate_db_paths()[0], "/somewhere/libaccounts-glib/accounts.db")
+
+    def test_falls_back_to_the_preferred_path_when_nothing_exists(self):
+        empty = os.path.join(self._dir.name, "empty")
+        with mock.patch.dict(os.environ, {"HOME": empty, "XDG_CONFIG_HOME": self.sandboxed}, clear=False):
+            os.environ.pop("ACCOUNTS", None)
+            provider = KdeAccountsProvider()
+            self.assertFalse(provider.available())
+            self.assertEqual(provider.db_path, candidate_db_paths()[0])
+
+    def test_an_explicit_path_is_never_second_guessed(self):
+        with mock.patch.dict(os.environ, {"HOME": self.home, "XDG_CONFIG_HOME": self.sandboxed}, clear=False):
+            self.assertEqual(KdeAccountsProvider(db_path="/given/accounts.db").db_path, "/given/accounts.db")
+
+
 class FallbackTests(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -106,7 +157,13 @@ class FallbackTests(unittest.TestCase):
         self.assertIs(PROVIDER_CLASSES["kde"], KdeAccountsProvider)
         self.assertTrue(self.provider.available())
         self.assertFalse(KdeAccountsProvider(db_path=os.path.join(self._dir.name, "nope.db"), use_gi=False).available())
-        self.assertIn(SIGNOND_NAME, self.provider.required_permissions()["dbus"])
+
+    def test_only_the_bus_name_has_to_be_granted(self):
+        # The database is under the user's home, which the app's manifest already grants, and
+        # /usr/share/accounts cannot be granted to a Flatpak at all.
+        permissions = self.provider.required_permissions()
+        self.assertEqual(permissions["dbus"], [SIGNOND_NAME])
+        self.assertEqual(permissions["filesystem"], [])
 
     def test_lists_every_enabled_account_classified(self):
         accounts = self.provider.list_accounts()

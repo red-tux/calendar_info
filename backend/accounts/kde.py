@@ -74,11 +74,24 @@ def parse_variant_text(type_string: str, text: str):
     return None
 
 
-def default_db_path() -> str:
-    # libaccounts-glib: $ACCOUNTS names the *parent* of its libaccounts-glib directory,
-    # otherwise the XDG config dir.
-    base = os.environ.get("ACCOUNTS") or os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "libaccounts-glib", "accounts.db")
+def candidate_db_paths() -> list[str]:
+    """Where libaccounts-glib's database may be, best guess first.
+
+    $ACCOUNTS names the *parent* of the libaccounts-glib directory, otherwise it is the XDG
+    config dir. The real home is tried as well because a Flatpak redirects XDG_CONFIG_HOME to
+    the app's own ~/.var/app/<id>/config, which never holds the desktop's accounts - while the
+    desktop's own ~/.config stays readable through the app's --filesystem=home.
+    """
+    bases = [os.environ.get("ACCOUNTS"), os.environ.get("XDG_CONFIG_HOME"),
+             os.path.join(os.path.expanduser("~"), ".config")]
+    paths = []
+    for base in bases:
+        if not base:
+            continue
+        path = os.path.join(base, "libaccounts-glib", "accounts.db")
+        if path not in paths:
+            paths.append(path)
+    return paths
 
 
 class KdeAccountsProvider(AccountProvider):
@@ -87,19 +100,32 @@ class KdeAccountsProvider(AccountProvider):
 
     def __init__(self, db_path: str | None = None, providers_dir: str | None = None,
                  bus_address: str | None = None, use_gi: bool = True):
-        self.db_path = db_path or default_db_path()
+        self._db_path = db_path
         self.providers_dir = providers_dir or os.environ.get("AG_PROVIDERS") or DEFAULT_PROVIDERS_DIR
         self.bus_address = bus_address if bus_address is not None else os.environ.get(BUS_ADDRESS_ENV, "")
         self.use_gi = use_gi
         self._tokens: dict[str, Credential] = {}
         self._connection = None
 
+    @property
+    def db_path(self) -> str:
+        """Resolved on every use, so a first account added while the app is running is found
+        without a restart. Falls back to the preferred path so errors name something sensible."""
+        if self._db_path:
+            return self._db_path
+        paths = candidate_db_paths()
+        return next((path for path in paths if os.path.isfile(path)), paths[0])
+
     def available(self) -> bool:
         return os.path.isfile(self.db_path)
 
     def required_permissions(self) -> dict:
-        return {"dbus": [SIGNOND_NAME],
-                "filesystem": ["xdg-config/libaccounts-glib:ro", "/usr/share/accounts:ro"]}
+        # Only the bus name. The account database lives under the user's home, which
+        # StreamController's manifest already grants (--filesystem=home), and the provider XML
+        # under /usr/share/accounts cannot be granted at all - a Flatpak cannot mount a host
+        # path over the runtime's /usr - nor does it need to be: an account carries its own
+        # copy of the auth parameters, and the XML is only an underlay for ones that don't.
+        return {"dbus": [SIGNOND_NAME], "filesystem": []}
 
     # --- discovery ---------------------------------------------------------------------
 
