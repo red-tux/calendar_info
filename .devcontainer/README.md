@@ -65,10 +65,83 @@ To use it: open a terminal in the container, run `claude`, and sign in once thro
 browser prompt (paste the code back into the terminal if the callback doesn't reach the
 container). Its configuration directory (`CLAUDE_CONFIG_DIR=/home/ubuntu/.claude`, holding
 the login token, settings, memory, and session transcripts so `claude --resume` works) lives
-in a named Docker volume keyed to this workspace. It survives container rebuilds, and it is
-never bind-mounted from or copied to the host, so host credentials are not exposed to the
-container and vice versa. Delete the volume (`docker volume ls | grep calendar-info`) to sign
-out completely.
+in a named Docker volume, `calendar-info-claude-shared`. It survives container rebuilds, and
+it is never bind-mounted from or copied to the host, so host credentials are not exposed to
+the container and vice versa. Delete the volume (`docker volume ls | grep calendar-info`) to
+sign out completely.
+
+Unlike the other volumes it is *not* keyed by `${devcontainerId}`: the default container and
+the KDE one below share it, so signing in, past sessions and Claude's memory carry across when
+you switch between them. Everything else - the StreamController data dir, shell history - stays
+per container. If you had signed in before this was shared, you will be asked to sign in once
+more; to carry the old volume over instead, with the containers stopped:
+
+```sh
+docker volume ls | grep claude            # find the old …-claude-config-<id> volume
+docker volume create calendar-info-claude-shared
+docker run --rm -v <old>:/from -v calendar-info-claude-shared:/to alpine sh -c 'cp -a /from/. /to/'
+```
+
+## KDE Online Accounts (optional, opt-in container)
+
+Only needed when working on the KDE integration, which lets a Google calendar take its
+credentials from an account added in KDE's *System Settings -> Online Accounts* instead of an
+OAuth client you registered yourself. **Everyone else can ignore this section** - the default
+dev container is unchanged and never touches any of it.
+
+Testing it needs a second container config, `.devcontainer/kde/`, because it mounts paths that
+only exist on a KDE host. In VS Code: *Dev Containers: Reopen in Container* and pick
+**"Calendar Info + KDE accounts"**.
+
+### Before you rebuild
+
+On the **host**, confirm the two mount sources exist, or the container will refuse to start:
+
+```sh
+ls /usr/share/accounts/providers/kde/     # kaccounts-providers - the OAuth definitions
+ls ~/.config/libaccounts-glib/accounts.db # created when you add your first account
+```
+
+If `accounts.db` is missing, add an account in *System Settings -> Online Accounts* first.
+
+### What it adds, and why
+
+| | |
+| --- | --- |
+| `DESKTOP_ACCOUNTS=1` build arg | Installs `gir1.2-accounts-1.0`, `gir1.2-signon-2.0` and `gir1.2-goa-1.0`. The `kaccounts-providers` package is deliberately *not* installed: it pulls ~139 KDE/Qt packages for five XML files, which the mount below provides instead. |
+| `/usr/share/accounts` -> `/run/host-accounts` (ro) | Provider definitions: OAuth client id, endpoints and scopes. `AG_PROVIDERS` points at the `providers/kde` subdirectory, because libaccounts-glib reads exactly one directory - it does not search subdirectories and does not accept a path list. |
+| `~/.config/libaccounts-glib` -> `/run/host-libaccounts` (ro) | The account database. `post-start.sh` links it into `~/.config/libaccounts-glib` inside the container: libaccounts-glib's `ACCOUNTS` override names the *parent* of the `libaccounts-glib` directory, and what is mounted here is that directory itself. |
+| `CALENDAR_INFO_ACCOUNTS_DBUS_ADDRESS` | The **host** session bus, where `signond` hands out tokens. The app itself keeps its own private bus, so `run_dev.sh --close-running` can never quit a StreamController running natively on your host. |
+
+The daemons stay on the host: the container never sees a refresh token, it asks the host's
+signond for a short-lived access token, and KWallet remains the thing guarding the secret.
+
+### Checking the wiring
+
+`post-start.sh` runs this on every start, and you can run it any time:
+
+```sh
+python3 .devcontainer/kde/check-accounts.py
+```
+
+It lists the providers it found, the accounts in the database, and whether signond answers.
+It never requests a token, so it cannot touch the account itself.
+
+### Notes
+
+- **This container has its own StreamController data volume**, so your calendars from the
+  default container are not there (Claude Code's volume *is* shared - see above). To copy the
+  data dir across (with both containers stopped):
+  ```sh
+  docker volume ls | grep calendar-info        # find the two data volume names
+  docker run --rm -v <old>:/from -v <new>:/to alpine sh -c 'cp -a /from/. /to/'
+  ```
+- The account database is mounted **read-only**. If libaccounts-glib refuses to open it that
+  way, `post-start.sh` says so and falls back to a copy - which then goes stale, so restart
+  the container after changing accounts on the host.
+- Flatpak users of the released plugin need to grant the session-bus name themselves
+  (Flatseal -> StreamController -> add `com.google.code.AccountsSSO.SingleSignOn` under
+  "Talk"), because StreamController's manifest does not request it yet.
 
 ## Why Pillow is rebuilt
 

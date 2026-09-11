@@ -19,6 +19,10 @@ ARG PYTHON_VERSION=3.12
 # in devcontainer.json's ${localEnv:...} syntax, so the empty value has to be handled here).
 ARG STREAMCONTROLLER_REPO=""
 ARG STREAMCONTROLLER_REF=main
+# 1 adds the desktop online-account client libraries (KDE KAccounts / Accounts-SSO, and GNOME
+# Online Accounts). Off by default so the standard image is unchanged; the KDE dev container
+# config (.devcontainer/kde/) turns it on.
+ARG DESKTOP_ACCOUNTS=0
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -35,6 +39,15 @@ RUN apt-get update && apt-get install -y \
     libopenjp2-7-dev liblcms2-dev libharfbuzz-dev libfribidi-dev \
     xdg-utils \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Client libraries for reading the desktop's online accounts and asking its daemon for tokens.
+# The daemons themselves (signond, KWallet) stay on the host - the container only ever talks to
+# them, which is why nothing here pulls a desktop environment.
+RUN if [ "$DESKTOP_ACCOUNTS" = "1" ]; then \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gir1.2-accounts-1.0 gir1.2-signon-2.0 gir1.2-goa-1.0 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # The container user is the image's stock `ubuntu` account (uid 1000).
 RUN echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu && chmod 0440 /etc/sudoers.d/ubuntu

@@ -1,0 +1,108 @@
+{
+  // Opt-in variant of ../devcontainer.json for developing the KDE Online Accounts
+  // integration. Pick it explicitly: "Dev Containers: Reopen in Container" and choose
+  // "Calendar Info + KDE accounts". The default config is untouched, so nobody without a
+  // KDE session ever has to care about any of this.
+  //
+  // What it adds:
+  //   - the Accounts-SSO / GOA client libraries in the image (DESKTOP_ACCOUNTS=1)
+  //   - read-only mounts of the host's account definitions and account database
+  //   - the address of the *host's* session bus, where signond lives
+  //
+  // Requires (on the host): a KDE session with kaccounts-providers installed and at least
+  // one account added in System Settings -> Online Accounts. Check before rebuilding:
+  //   ls /usr/share/accounts/providers/kde/ ~/.config/libaccounts-glib/
+  "name": "Calendar Info + KDE accounts (StreamController plugin)",
+  "build": {
+    // One image definition for both configs; the context stays .devcontainer/ so the
+    // Dockerfile's COPY of scripts/ still resolves.
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "options": ["--network", "host"],
+    "args": {
+      "STREAMCONTROLLER_REF": "${localEnv:STREAMCONTROLLER_REF:main}",
+      "STREAMCONTROLLER_REPO": "${localEnv:STREAMCONTROLLER_REPO}",
+      "PYTHON_VERSION": "${localEnv:STREAMCONTROLLER_PYTHON:3.12}",
+      "DESKTOP_ACCOUNTS": "1"
+    }
+  },
+  "remoteUser": "ubuntu",
+
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/StreamController/data/plugins/net_red-tux_calendar_info,type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/StreamController/data/plugins/net_red-tux_calendar_info",
+
+  "runArgs": [
+    "--init",
+    "--privileged",
+    "--network=host",
+    "--device=/dev/bus/usb:/dev/bus/usb"
+  ],
+  "mounts": [
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
+    "source=${localEnv:XDG_RUNTIME_DIR:/run/user/1000},target=/run/host-user,type=bind",
+
+    // Provider/service definitions from kaccounts-providers: the OAuth client id, endpoints
+    // and scopes that libaccounts-glib merges into an account's login parameters. Read-only,
+    // and mounted rather than apt-installed because the kaccounts-providers package would
+    // pull ~139 KDE/Qt packages into the image for five XML files.
+    "source=/usr/share/accounts,target=/run/host-accounts,type=bind,readonly",
+
+    // The account database. Read-only on purpose: this is the real thing, and nothing in
+    // this plugin ever writes an account. post-start.sh falls back to a copy if the library
+    // refuses a read-only database.
+    "source=${localEnv:HOME}/.config/libaccounts-glib,target=/run/host-libaccounts,type=bind,readonly",
+
+    // Separate from the default config's volumes - this container has its own StreamController
+    // data dir. See .devcontainer/README.md for how to clone the other one if you want your
+    // existing calendars here.
+    "source=calendar-info-kde-sc-data-${devcontainerId},target=/workspaces/StreamController/data,type=volume",
+    // Shared with the default config on purpose - see the comment there. The data dir above
+    // stays separate; only Claude Code's login, transcripts and memory carry across.
+    "source=calendar-info-claude-shared,target=/home/ubuntu/.claude,type=volume",
+    "source=calendar-info-kde-bash-history-${devcontainerId},target=/commandhistory,type=volume"
+  ],
+  "containerEnv": {
+    "DISPLAY": "${localEnv:DISPLAY}",
+    "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY:wayland-0}",
+    "XDG_RUNTIME_DIR": "/run/user/1000",
+    // The app keeps its own private session bus, exactly as in the default config.
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+    // ...and only the account helper is pointed at the host's bus, where signond and the
+    // rest of the KDE session live. Keeping these separate means run_dev.sh's
+    // --close-running can never reach a StreamController running natively on the host.
+    "CALENDAR_INFO_ACCOUNTS_DBUS_ADDRESS": "unix:path=/run/host-user/bus",
+    // libaccounts-glib reads exactly one directory per variable - no subdirectory search,
+    // no path lists - and KDE installs its definitions under the kde/ subdirectory.
+    "AG_PROVIDERS": "/run/host-accounts/providers/kde",
+    "AG_SERVICES": "/run/host-accounts/services/kde",
+    "AG_SERVICE_TYPES": "/run/host-accounts/service_types",
+    "PULSE_SERVER": "unix:/run/host-user/pulse/native",
+    "GSK_RENDERER": "ngl",
+    "PKG_CONFIG_PATH": "/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig:${containerEnv:PKG_CONFIG_PATH}",
+    "CLAUDE_CONFIG_DIR": "/home/ubuntu/.claude"
+  },
+
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.debugpy",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/app/.venv/bin/python",
+        "python.analysis.extraPaths": ["/workspaces/StreamController"],
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/scripts/post-create.sh",
+  "postStartCommand": "bash .devcontainer/kde/post-start.sh"
+}

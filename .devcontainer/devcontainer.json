@@ -42,7 +42,11 @@
     //  - Claude Code's config dir: login, settings, memory and session transcripts
     //  - shell history
     "source=calendar-info-sc-data-${devcontainerId},target=/workspaces/StreamController/data,type=volume",
-    "source=calendar-info-claude-config-${devcontainerId},target=/home/ubuntu/.claude,type=volume",
+    // Deliberately NOT keyed by ${devcontainerId}: this one volume is shared with the KDE
+    // config (.devcontainer/kde/), so Claude Code's login, transcripts and memory for this
+    // plugin survive switching between the two containers. The project directory is the
+    // same path in both, so the history lands under the same key either way.
+    "source=calendar-info-claude-shared,target=/home/ubuntu/.claude,type=volume",
     "source=calendar-info-bash-history-${devcontainerId},target=/commandhistory,type=volume"
   ],
   "containerEnv": {
