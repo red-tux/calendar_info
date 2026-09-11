@@ -95,6 +95,18 @@ verified one commits the project to brand review and re-verification.
   `describe_token_error()` maps Google's OAuth errors onto the setup step that was missed.
 - `backend/accounts/oauth_google.py` - the `oauth` provider: refresh-token handling on top of
   `TokenStore`, revoke-and-delete on `forget()`.
+- `backend/accounts/kde.py` - the `kde` provider (KDE Online Accounts / Accounts-SSO). Account
+  discovery tries the `Accounts-1.0` GI binding and falls back to reading
+  `~/.config/libaccounts-glib/accounts.db` (SQLite, read-only) plus the `.provider` XML with
+  stdlib only - that fallback is what runs inside the Flatpak, where the typelib doesn't exist.
+  Tokens come from signond over plain GDBus (`AuthService.getAuthSessionObjectPath` ->
+  `AuthSession.process`, `UiPolicy=2` so a dead login fails instead of popping a dialog);
+  the reply's short-lived access token is cached in memory and **nothing is written to
+  disk** - the refresh token stays in the desktop. `call_sync` needs no GLib main loop, so
+  none runs in the backend. The bus is `$CALENDAR_INFO_ACCOUNTS_DBUS_ADDRESS` when set (the
+  dev container's host bus), else this process's session bus. Only `SUPPORTED_PROVIDERS`
+  (`google`) are offered; a password-method account (Nextcloud) would map to a basic
+  credential for a future CalDAV source. `required_permissions()` lists the Flatpak grants.
 - `backend/google_source.py` - `TokenStore` (one 0600 JSON file per account under
   `credentials/`, created 0600 rather than chmod-ed afterwards), `GoogleClient` (takes a
   provider + account id, one forced-refresh retry on a 401, error mapping) and `map_event()`,
@@ -130,11 +142,19 @@ verified one commits the project to brand review and re-verification.
 - `actions/NextEvent`, `actions/Agenda`, `actions/UpcomingDial` - the actions. Each `render()`
   builds a tuple of everything that affects the display, compares it with `_last_render_key`,
   and only pushes to the hardware on change.
-- `settings_area.py` - `CalendarSettingsGroup(Adw.PreferencesGroup)`: option rows, the Google
-  account section (client id/secret, Connect, linked accounts, the setup-guide dialog and the
+- `settings_area.py` - `CalendarSettingsGroup(Adw.PreferencesGroup)`: option rows, the accounts
+  section (OAuth client id/secret, Connect, "Link a desktop account" for `DESKTOP_PROVIDERS`,
+  linked accounts labelled by `PROVIDER_LABELS`, the setup-guide dialog and the
   `calendarList`-driven calendar picker), then the calendar list of `CalendarRow(Adw.ExpanderRow)`;
   must stay a single `PreferencesGroup` because the app adds it to an `Adw.PreferencesPage`.
-  `CalendarRow` renders a Google entry without the address/Test rows - there is nothing to type.
+  Linking a desktop account lists its calendars once to learn the address (the primary
+  calendar's id) and links even if that first token request fails, so "Add calendars" can retry
+  after permissions are fixed. `CalendarRow` builds its rows per `type` (`_build_google_rows`,
+  `_build_ics_rows`); a Google entry has no address/Test rows - there is nothing to type.
+- Flatpak grants for desktop providers go through `CalendarInfoPlugin.ensure_provider_permissions()`:
+  D-Bus names via the app's `request_dbus_permission()` dialog, filesystem paths as a
+  `flatpak override --user` line the UI shows (`_show_sandbox_hint`) because the app has no
+  dialog for those. Both are user-level overrides; the app's manifest is not touched.
 
 ### Threading model
 

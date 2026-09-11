@@ -27,7 +27,9 @@ TIME_FORMAT_OPTIONS = [("auto", "System default"), ("12", "12-hour"), ("24", "24
 DEFAULT_COLOR = (66, 133, 244, 255)
 DEFAULT_ACCOUNT_PROVIDER = "oauth"
 # How each account provider (backend/accounts/registry.py) is named in the UI.
-PROVIDER_LABELS = {"oauth": "Google OAuth client"}
+PROVIDER_LABELS = {"oauth": "Google OAuth client", "kde": "KDE Online Accounts"}
+# Providers whose accounts come from the desktop rather than a consent flow here.
+DESKTOP_PROVIDERS = ("kde",)
 
 @functools.lru_cache(maxsize=1)
 def available_timezones() -> list[str]:
@@ -291,6 +293,15 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
         self.connect_row.add_suffix(self.connect_button)
         self.google_list.append(self.connect_row)
 
+        self.desktop_button = Gtk.Button(label="Link…", valign=Gtk.Align.CENTER)
+        self.desktop_button.connect("clicked", self._on_link_desktop_clicked)
+        self.desktop_row = Adw.ActionRow(
+            title="Link a desktop account",
+            subtitle="A Google account from your desktop's Online Accounts (KDE). No OAuth client needed.",
+        )
+        self.desktop_row.add_suffix(self.desktop_button)
+        self.google_list.append(self.desktop_row)
+
         self._account_rows: dict[tuple[str, str], Adw.ActionRow] = {}
         self._refresh_google_rows()
 
@@ -431,6 +442,104 @@ class CalendarSettingsGroup(Adw.PreferencesGroup):
     def _on_disconnected(self) -> None:
         self._refresh_google_rows()
         self.connect_status.set_label("Disconnected")
+
+    # --- desktop accounts (KDE Online Accounts today) ------------------------------------------
+    #
+    # No consent flow: the desktop already holds the login, the user just picks the account.
+    # The desktop's token daemon hands out short-lived tokens, so nothing is stored here.
+
+    def _on_link_desktop_clicked(self, button) -> None:
+        button.set_sensitive(False)
+        self.connect_status.set_label("Looking for desktop accounts…")
+        threading.Thread(target=self._list_desktop_thread, name="calendar_desktop_list", daemon=True).start()
+
+    def _list_desktop_thread(self) -> None:
+        result = self.plugin_base.list_desktop_accounts()
+        GLib.idle_add(self._show_desktop_picker, result)
+
+    def _show_desktop_picker(self, result: dict) -> None:
+        self.desktop_button.set_sensitive(True)
+        accounts = result.get("accounts") or []
+        if not accounts:
+            self.connect_status.set_label(
+                result.get("error") or "No desktop accounts found - add a Google account in "
+                "System Settings -> Online Accounts first")
+            self._show_sandbox_hint()
+            return
+        self.connect_status.set_label("")
+
+        linked = {(a["provider"], a["id"]) for a in self.plugin_base.get_accounts()}
+        dialog = Adw.Dialog(title="Link a desktop account", content_width=520, content_height=420)
+        group = Adw.PreferencesGroup(
+            title="Accounts on this desktop",
+            description="Linking uses the desktop's own login; this plugin stores no token for it.",
+        )
+        for account in accounts:
+            provider_label = PROVIDER_LABELS.get(account["provider"], account["provider"])
+            row = Adw.ActionRow(title=GLib.markup_escape_text(_account_title(account)),
+                                subtitle=GLib.markup_escape_text(provider_label))
+            if (account["provider"], account["id"]) in linked:
+                row.set_subtitle("Already linked")
+                row.set_sensitive(False)
+            else:
+                button = Gtk.Button(label="Link", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+                button.connect("clicked", lambda _b, a=account: self._link_desktop_account(a, dialog))
+                row.add_suffix(button)
+            group.add(row)
+        page = Adw.PreferencesPage()
+        page.add(group)
+        toolbar = Adw.ToolbarView(content=page)
+        toolbar.add_top_bar(Adw.HeaderBar())
+        dialog.set_child(toolbar)
+        dialog.present(self)
+
+    def _link_desktop_account(self, account: dict, dialog) -> None:
+        dialog.close()
+        self.plugin_base.ensure_provider_permissions(account["provider"])
+        self.connect_status.set_label(f"Linking {_account_title(account)}…")
+        threading.Thread(target=self._link_desktop_thread, args=(account,),
+                         name="calendar_desktop_link", daemon=True).start()
+
+    def _link_desktop_thread(self, account: dict) -> None:
+        # The primary calendar's id is the account's address - the same trick the OAuth flow
+        # uses - and listing it is the first real use of the desktop's token.
+        result = self.plugin_base.list_calendars("google", account["provider"], account["id"])
+        email = ""
+        for calendar in result.get("calendars") or []:
+            if calendar.get("primary") and "@" in str(calendar.get("id") or ""):
+                email = str(calendar["id"])
+                break
+        GLib.idle_add(self._on_desktop_linked, account, email, result)
+
+    def _on_desktop_linked(self, account: dict, email: str, result: dict) -> None:
+        # Linked even if the first token request failed: the account row's "Add calendars"
+        # retries, and in a Flatpak the fix is granting the permissions shown above.
+        self.plugin_base.add_account(account["provider"], account["id"],
+                                     label=account.get("label", ""), email=email)
+        self._refresh_google_rows()
+        if result.get("ok"):
+            self.connect_status.set_label(f"Linked {email or _account_title(account)}")
+        else:
+            self.connect_status.set_label(f"Linked, but the desktop login failed: {result.get('error')}")
+
+    def _show_sandbox_hint(self) -> None:
+        """In a Flatpak the desktop's account list is outside the sandbox until the user grants
+        access; the app has a dialog for D-Bus names but not for filesystem paths, so the
+        override command is shown for them to run."""
+        commands = [self.plugin_base.ensure_provider_permissions(p) for p in DESKTOP_PROVIDERS]
+        commands = [c for c in commands if c]
+        if not commands:
+            return
+        dialog = Adw.AlertDialog(
+            heading="Let StreamController see your desktop accounts",
+            body=("StreamController runs in a Flatpak sandbox, which hides the desktop's account "
+                  "list. Run this once in a terminal, then restart StreamController:"),
+        )
+        label = Gtk.Label(label="\n".join(commands), selectable=True, wrap=True, xalign=0,
+                          css_classes=["monospace"])
+        dialog.set_extra_child(label)
+        dialog.add_response("ok", "OK")
+        dialog.present(self)
 
     # --- setup guide -------------------------------------------------------------------------
 

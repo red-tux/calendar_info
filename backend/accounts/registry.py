@@ -6,12 +6,14 @@ backend, the settings UI's list rendering, or the RPyC surface has to learn abou
 from __future__ import annotations
 
 from backend.accounts.base import AccountProvider
+from backend.accounts.kde import KdeAccountsProvider
 from backend.accounts.oauth_google import OAuthGoogleProvider
 
 DEFAULT_PROVIDER = OAuthGoogleProvider.provider_id
 
 PROVIDER_CLASSES: dict[str, type[AccountProvider]] = {
     OAuthGoogleProvider.provider_id: OAuthGoogleProvider,
+    KdeAccountsProvider.provider_id: KdeAccountsProvider,
 }
 
 

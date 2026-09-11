@@ -1,4 +1,5 @@
 # Import StreamController modules
+import globals as gl
 from src.backend.PluginManager.PluginBase import PluginBase
 from src.backend.PluginManager.ActionHolder import ActionHolder
 from src.backend.PluginManager.ActionInputSupport import ActionInputSupport
@@ -413,6 +414,43 @@ class CalendarInfoPlugin(PluginBase):
             return json.loads(self.backend.list_calendars(calendar_type, provider, account_id))
         except Exception as e:
             return {"ok": False, "calendars": [], "error": str(e)}
+
+    # --- Flatpak sandbox permissions ----------------------------------------------------------
+    #
+    # Desktop providers reach outside the sandbox (the desktop's token daemon on the session
+    # bus, its account database on disk). Both are `flatpak override --user` grants, no manifest
+    # change: the app already has a dialog for D-Bus names, none yet for filesystem paths.
+
+    def is_flatpak(self) -> bool:
+        manager = getattr(gl, "flatpak_permission_manager", None)
+        return bool(manager is not None and manager.get_is_flatpak())
+
+    def provider_permissions(self, provider: str) -> dict:
+        """{"dbus": [...], "filesystem": [...]} the provider needs beyond the app's own."""
+        if self.backend is None:
+            return {"dbus": [], "filesystem": []}
+        try:
+            return json.loads(self.backend.provider_permissions(provider))
+        except Exception as e:
+            log.warning(f"Could not read {provider} permissions: {e}")
+            return {"dbus": [], "filesystem": []}
+
+    def ensure_provider_permissions(self, provider: str) -> str:
+        """Main thread, Flatpak only (empty string elsewhere). Requests each D-Bus name through
+        the app's own permission dialog and returns the `flatpak override` line for the
+        filesystem paths, for the UI to show - the app has no dialog for those."""
+        if not self.is_flatpak():
+            return ""
+        needed = self.provider_permissions(provider)
+        for name in needed.get("dbus") or []:
+            self.request_dbus_permission(
+                name, "session",
+                f"Calendar Info needs to talk to {name} to use the accounts set up in your desktop.")
+        paths = needed.get("filesystem") or []
+        if not paths:
+            return ""
+        return ("flatpak override --user " + " ".join(f"--filesystem={p}" for p in paths)
+                + f" {gl.flatpak_permission_manager.app_id}")
 
     def google_start_auth(self, client_id: str, client_secret: str) -> dict:
         """Ask the backend to open a consent flow. Returns {"ok", "flow_id", "auth_url", "error"}."""

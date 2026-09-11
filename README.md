@@ -72,6 +72,21 @@ The refresh token is stored in `credentials/` inside the plugin folder, mode 060
 the settings file. **Disconnect** revokes it with Google and deletes both the token and every
 calendar that was reading through it.
 
+### Or: use the Google account from your desktop (KDE)
+
+If you run KDE Plasma and your Google account is already in *System Settings → Online
+Accounts*, skip the whole OAuth client setup: under **Google Calendar** press **Link…** next to
+*Link a desktop account* and pick it. The desktop's own login is used, the plugin stores no
+token at all (it asks the desktop for a short-lived one when it needs it), and **Add calendars**
+works exactly as above. Disconnecting here only unlinks it from the plugin; the desktop account
+itself is untouched.
+
+Two notes for the Flatpak build of StreamController: the sandbox hides the desktop's account
+list and its login service, so the first time you link, the plugin asks for the D-Bus permission
+through StreamController's own dialog and shows a one-line `flatpak override` command for the
+file access. Run it, restart StreamController, and link again. Nothing in StreamController's
+own packaging changes.
+
 ### When something goes wrong
 
 | What you see | What it means |
@@ -81,6 +96,8 @@ calendar that was reading through it.
 | `redirect_uri_mismatch` | The client is not of type *Desktop app*. Create a new one. |
 | "The Google Calendar API is not enabled…" | Step 2 was skipped or ran against another project. The message carries the exact link to enable it. |
 | "Reconnect needed" on a calendar | Access was revoked (password change, or removed at [myaccount.google.com/permissions](https://myaccount.google.com/permissions)). Connect the account again. |
+| "KDE Online Accounts could not provide a login…" | The desktop's stored login has expired or been revoked. Open *System Settings → Online Accounts*, re-authenticate the account, then refresh. In a Flatpak, also check the two permissions described above. |
+| "No desktop accounts found" | No Google account in *System Settings → Online Accounts* yet - or, in a Flatpak, the file access hasn't been granted (the plugin shows the command). |
 
 ## The actions
 
